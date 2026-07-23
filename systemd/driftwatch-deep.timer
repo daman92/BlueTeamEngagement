@@ -1,0 +1,15 @@
+[Unit]
+Description=driftwatch deep collection cadence (daily, off-hours)
+Documentation=file:///opt/driftwatch/systemd/README.md
+
+[Timer]
+# Daily, off-hours: hashing/cert-store/SUID work is heavy, so run it once when the fleet is
+# quiet (design §8). Scale via a drop-in to match scope.yml settings.deep_interval.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=1800
+AccuracySec=5min
+Persistent=true
+Unit=driftwatch-deep.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,50 @@
+---
+# W11a software (CONTRACTS §3.2 `software`)
+# identity: name | other: version, publisher, install_date, view (`64`|`32`)
+#
+# Uninstall registry keys in both registry views (native = view 64, Wow6432Node = view 32)
+# plus per-user hives (design W11). Registry reads are cheap, so this runs every cycle;
+# heavy hashing is not part of this category.
+
+- name: "W11a installed software"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+      $sources = @(
+        @{ path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall';            view = '64' },
+        @{ path = 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall'; view = '32' }
+      )
+      foreach ($u in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        $sid = $u.PSChildName
+        if ($sid -match '_Classes$') { continue }
+        $sources += @{ path = "Registry::HKEY_USERS\$sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"; view = '64' }
+      }
+
+      foreach ($src in $sources) {
+        foreach ($k in (Get-ChildItem -Path $src.path -ErrorAction SilentlyContinue)) {
+          $p = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+          if (-not $p) { continue }
+          if (-not $p.DisplayName) { continue }
+          if ($p.SystemComponent -eq 1) { continue }
+          [void]$out.Add([ordered]@{
+            name         = "$($p.DisplayName)"
+            version      = if ($p.DisplayVersion) { "$($p.DisplayVersion)" } else { $null }
+            publisher    = if ($p.Publisher)      { "$($p.Publisher)" }      else { $null }
+            install_date = if ($p.InstallDate)    { "$($p.InstallDate)" }    else { $null }
+            view         = $src.view
+          })
+        }
+      }
+      $out
+  register: reg_software
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record software collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['software'] }}"
+  when: reg_software is failed

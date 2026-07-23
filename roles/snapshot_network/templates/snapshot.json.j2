@@ -1,0 +1,15 @@
+{#-
+  driftwatch network snapshot document — CONTRACTS.md §2 + §3.4.
+
+  The snapshot dict is assembled in-play by tasks/*.yml (tier handler +
+  tasks/main.yml). This template only SERIALIZES it, so the written document
+  always matches exactly what the selected tier actually collected:
+
+    * top-level keys = "meta" + the network category keys that were produced
+    * T1 aims for the full §3.4 category set; T2 fills whatever the command
+      pack defines (+ device_config); T3 delivers device_config only.
+
+  Rendered on the control node via `ansible.builtin.template` delegated to
+  localhost — nothing is written to the target device.
+-#}
+{{ ({'meta': dw_net_meta} | combine(dw_net_categories)) | to_nice_json }}

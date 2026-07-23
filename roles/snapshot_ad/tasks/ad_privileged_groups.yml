@@ -1,0 +1,67 @@
+---
+# tasks/ad_privileged_groups.yml — CONTRACTS.md §3.3 ad_privileged_groups
+# identity: group, member_sid | other: member_sam, nesting_path
+#
+# FULL nested expansion (W18): for each privileged group, walk every level of nested
+# membership and emit one row per distinct member principal, recording the exact chain
+# by which it is reached (nesting_path). Cycle-safe; identity survives renames via SID.
+
+- name: Collect fully-expanded privileged group membership (ad_privileged_groups) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      PrivilegedGroups: "{{ dw_ad_privileged_groups }}"
+    script: |
+      param(
+        [string[]]$PrivilegedGroups
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $rows = New-Object System.Collections.Generic.List[object]
+      foreach ($gname in $PrivilegedGroups) {
+        $grp = $null
+        try { $grp = Get-ADGroup -Identity $gname -ErrorAction Stop } catch { continue }
+
+        $seen = New-Object System.Collections.Generic.HashSet[string]
+        $stack = New-Object System.Collections.Stack
+        [void]$stack.Push([pscustomobject]@{ Dn = [string]$grp.DistinguishedName; Path = [string]$grp.Name })
+        [void]$seen.Add('G:' + [string]$grp.DistinguishedName)
+
+        while ($stack.Count -gt 0) {
+          $node = $stack.Pop()
+          $direct = @()
+          try { $direct = Get-ADGroupMember -Identity $node.Dn -ErrorAction Stop } catch { $direct = @() }
+          foreach ($m in $direct) {
+            $sid = if ($m.SID) { [string]$m.SID.Value } else { $null }
+            $childPath = "$($node.Path) -> $($m.name)"
+            $memKey = 'M:' + [string]$grp.Name + '|' + [string]$sid
+            if ($sid -and -not $seen.Contains($memKey)) {
+              [void]$seen.Add($memKey)
+              $rows.Add(@{
+                group        = [string]$grp.Name
+                member_sid   = $sid
+                member_sam   = [string]$m.SamAccountName
+                nesting_path = $childPath
+              })
+            }
+            if ($m.objectClass -eq 'group') {
+              $gKey = 'G:' + [string]$m.distinguishedName
+              if (-not $seen.Contains($gKey)) {
+                [void]$seen.Add($gKey)
+                [void]$stack.Push([pscustomobject]@{ Dn = [string]$m.distinguishedName; Path = $childPath })
+              }
+            }
+          }
+        }
+      }
+      $Ansible.Result = @($rows)
+  register: ad_privileged_groups_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_privileged_groups result / status
+  ansible.builtin.set_fact:
+    ad_privileged_groups_items: "{{ ad_privileged_groups_reg.result | default([]) if ad_privileged_groups_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_privileged_groups'] if ad_privileged_groups_reg is failed else []) }}"

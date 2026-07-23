@@ -1,0 +1,50 @@
+---
+# W3 listening (CONTRACTS §3.2 `listening`)
+# identity: proto, port, path | volatile: pid | other: bind
+
+- name: "W3 listening ports"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $pathById = @{}
+      foreach ($pr in (Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $ipid = [int]$pr.ProcessId
+        if (-not $pathById.ContainsKey($ipid)) { $pathById[$ipid] = $pr.ExecutablePath }
+      }
+      function Resolve-Exe([int]$procId) { if ($pathById.ContainsKey($procId)) { return $pathById[$procId] } else { return $null } }
+
+      $out = New-Object System.Collections.ArrayList
+      try {
+        foreach ($c in (Get-NetTCPConnection -State Listen -ErrorAction Stop)) {
+          [void]$out.Add([ordered]@{
+            proto = 'tcp'
+            port  = [int]$c.LocalPort
+            path  = (Resolve-Exe ([int]$c.OwningProcess))
+            pid   = [int]$c.OwningProcess
+            bind  = "$($c.LocalAddress)"
+          })
+        }
+      } catch {}
+      try {
+        foreach ($u in (Get-NetUDPEndpoint -ErrorAction Stop)) {
+          [void]$out.Add([ordered]@{
+            proto = 'udp'
+            port  = [int]$u.LocalPort
+            path  = (Resolve-Exe ([int]$u.OwningProcess))
+            pid   = [int]$u.OwningProcess
+            bind  = "$($u.LocalAddress)"
+          })
+        }
+      } catch {}
+      $out
+  register: reg_listening
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record listening collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['listening'] }}"
+  when: reg_listening is failed

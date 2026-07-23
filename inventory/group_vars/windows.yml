@@ -1,0 +1,40 @@
+# driftwatch — group_vars for the `windows` group (design §3, §3.1)
+# =============================================================================
+# Transport ladder (the kit is NOT domain-joined; targets usually are):
+#   Rung 1 (default here): Kerberos over WinRM-HTTPS (5986), cert validation on.
+#   Rung 2: OpenSSH with ansible_shell_type=powershell — set PER HOST in the
+#           inventory only where the feature already exists (enabling it is a
+#           write action on a client box; design §3.1).
+#   Rung 3: NTLM over WinRM-HTTPS — last-resort, documented exception only.
+#           Never WinRM over HTTP (5985) under any circumstance.
+# The preflight verb records which rung each host will actually use. Kerberos
+# needs, on the kit: a TGT (kinit), DNS pointed at the client DC, and clock sync
+# within 5 minutes of the DC.
+# =============================================================================
+
+dw_platform: windows
+
+# --- connection: Rung 1, Kerberos / WinRM-HTTPS ------------------------------
+ansible_connection: winrm
+ansible_port: 5986
+ansible_winrm_scheme: https
+ansible_winrm_transport: kerberos
+# Certificate validation ON — never disable it (design §9 transport downgrade).
+ansible_winrm_server_cert_validation: validate
+
+ansible_user: "{{ vault_windows_user | default('') }}"
+# Kerberos authenticates from the kit's TGT (kinit user@REALM); a vault password
+# is only needed for the NTLM/SSH rungs. Reference by name, never inline:
+# ansible_password: "{{ vault_windows_password }}"
+
+# --- rung 2 fallback (OpenSSH) — set per-host in inventory when WinRM is absent
+# ansible_connection: ssh
+# ansible_shell_type: powershell
+# ansible_shell_executable: null
+
+# --- rung 3 exception (NTLM) — documented per-host only ----------------------
+# ansible_winrm_transport: ntlm     # HTTPS + cert validation still MANDATORY
+
+# WinRM round-trips dominate cost on Windows; the CLI uses serial batches for
+# WinRM-heavy groups (design §8). Sub-groups win_servers / win_workstations may
+# tune hashing scope (design C.2) via their own group_vars.

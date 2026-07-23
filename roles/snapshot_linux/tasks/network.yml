@@ -1,0 +1,258 @@
+---
+# tasks/network.yml — network exposure & trust surface.
+#   L3  listening      : ss -tulpen (proto, port, path, pid, bind, user)
+#   L4  connections    : ss established (path, remote_ip, remote_port, proto, user; counted)
+#   L14 firewall       : nft / iptables-save (rule, table, chain)
+#   L15 dns_trust      : resolvers, hosts entries, proxy env, CA bundle (+ certs when deep)
+#   L16 shares         : /etc/exports (nfs) + smb.conf (smb)
+# Each collector emits US(0x1F)-delimited lines; the template maps them to the
+# CONTRACTS.md §3.1 field sets. Exe path/user are resolved from the owning PID via
+# read-only /proc reads.
+
+# -------------------------------------------------------------------- L3 listening
+- name: L3 collect listening sockets (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    ss -Hutlpn 2>/dev/null | while IFS= read -r line; do
+      netid=$(printf '%s' "$line" | awk '{print $1}')
+      local=$(printf '%s' "$line" | awk '{print $5}')
+      pid=$(printf '%s' "$line" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+      port=${local##*:}
+      bind=${local%:*}
+      path=""; user=""
+      if [ -n "$pid" ]; then
+        path=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        user=$(stat -c %U "/proc/$pid" 2>/dev/null)
+      fi
+      printf '%s\n' "$netid$US$port$US$path$US$pid$US$bind$US$user"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_listen
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L3 stash listening records
+  ansible.builtin.set_fact:
+    dw_raw_listening: "{{ dw_listen.stdout | default('') }}"
+
+- name: L3 mark listening failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['listening'] }}"
+  when: (dw_listen.rc | default(1)) != 0
+
+# ------------------------------------------------------------------ L4 connections
+- name: L4 collect established connections (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    ss -Hantup state established 2>/dev/null | while IFS= read -r line; do
+      netid=$(printf '%s' "$line" | awk '{print $1}')
+      # Peer is the 2nd addr:port token. ss omits the State column when a single
+      # state is filtered, so positional fields shift between iproute2 versions —
+      # match the token shape instead of a column number.
+      peer=$(printf '%s' "$line" | awk '{n=0; for(i=1;i<=NF;i++) if ($i ~ /:([0-9]+|\*)$/) {n++; if (n==2) {print $i; exit}}}')
+      pid=$(printf '%s' "$line" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+      rport=${peer##*:}
+      rip=${peer%:*}
+      [ -n "$rip" ] || continue
+      path=""; user=""
+      if [ -n "$pid" ]; then
+        path=$(readlink "/proc/$pid/exe" 2>/dev/null)
+        user=$(stat -c %U "/proc/$pid" 2>/dev/null)
+      fi
+      printf '%s\n' "$netid$US$rip$US$rport$US$path$US$pid$US$user"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_conns
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L4 stash connection records
+  ansible.builtin.set_fact:
+    dw_raw_connections: "{{ dw_conns.stdout | default('') }}"
+
+- name: L4 mark connections failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['connections'] }}"
+  when: (dw_conns.rc | default(1)) != 0
+
+# --------------------------------------------------------------------- L14 firewall
+- name: L14 collect host firewall ruleset (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    if command -v nft >/dev/null 2>&1 && [ -n "$(nft list ruleset 2>/dev/null)" ]; then
+      nft -nn list ruleset 2>/dev/null | awk -v US="$US" '
+        /^table / {tbl=$2" "$3; next}
+        /chain / && /{/ {ch=$2; next}
+        /^[[:space:]]*}/ {ch=""; next}
+        {
+          line=$0; gsub(/^[[:space:]]+/,"",line); gsub(/[[:space:]]+$/,"",line);
+          gsub(/[[:space:]]+/," ",line);
+          if (ch!="" && line!="" && line!="{" && line !~ /^(type|hook|policy|comment)/)
+            print tbl US ch US line
+        }'
+    elif command -v iptables-save >/dev/null 2>&1; then
+      { iptables-save 2>/dev/null; ip6tables-save 2>/dev/null; } | awk -v US="$US" '
+        /^\*/ {tbl=substr($1,2); next}
+        /^:/  {next}
+        /^-A/ {ch=$2; line=$0; gsub(/[[:space:]]+/," ",line); print tbl US ch US line; next}'
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_fw
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L14 stash firewall records
+  ansible.builtin.set_fact:
+    dw_raw_firewall: "{{ dw_fw.stdout | default('') }}"
+
+- name: L14 mark firewall failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['firewall'] }}"
+  when: (dw_fw.rc | default(1)) != 0
+
+# -------------------------------------------------------------------- L15 dns_trust
+- name: L15 collect DNS / proxy / trust store (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    DEEP={{ (dw_deep | bool) | ternary('1', '0') }}
+
+    # resolvers from resolv.conf
+    if [ -f /etc/resolv.conf ]; then
+      grep -E '^[[:space:]]*nameserver' /etc/resolv.conf 2>/dev/null \
+        | awk -v US="$US" '{print "resolver" US $2 US $2}'
+    fi
+    # resolvers behind systemd-resolved (upstreams, best effort)
+    if command -v resolvectl >/dev/null 2>&1; then
+      resolvectl dns 2>/dev/null | tr ' ' '\n' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$|^[0-9a-fA-F:]+:[0-9a-fA-F:]+$' \
+        | while IFS= read -r ns; do printf '%s\n' "resolver$US$ns${US}resolved"; done
+    fi
+    # hosts-file entries
+    if [ -f /etc/hosts ]; then
+      grep -vE '^[[:space:]]*(#|$)' /etc/hosts 2>/dev/null | while IFS= read -r hl; do
+        hl=${hl%%#*}
+        ip=$(printf '%s' "$hl" | awk '{print $1}')
+        names=$(printf '%s' "$hl" | cut -s -d' ' -f2- 2>/dev/null)
+        [ -n "$names" ] || names=$(printf '%s' "$hl" | awk '{$1="";print}')
+        for name in $names; do
+          [ -n "$name" ] && printf '%s\n' "hosts_entry$US$name$US$ip"
+        done
+      done
+    fi
+    # proxy environment
+    for f in /etc/environment /etc/profile.d/*.sh; do
+      [ -f "$f" ] || continue
+      grep -iE '^(export[[:space:]]+)?(https?|ftp|all|no)_proxy=' "$f" 2>/dev/null \
+        | while IFS= read -r pl; do
+            pl=${pl#export }; pl=$(printf '%s' "$pl" | sed 's/^[[:space:]]*//')
+            var=${pl%%=*}; val=${pl#*=}
+            val=$(printf '%s' "$val" | tr -d "\"'")
+            printf '%s\n' "proxy$US$var$US$val"
+          done
+    done
+    # CA bundle hash + count, and per-cert enumeration when deep
+    bundle=""
+    for b in /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/certs/ca-certificates.crt; do
+      [ -f "$b" ] && { bundle="$b"; break; }
+    done
+    if [ -n "$bundle" ]; then
+      h=$(sha256sum "$bundle" 2>/dev/null | awk '{print $1}')
+      c=$(grep -c 'BEGIN CERTIFICATE' "$bundle" 2>/dev/null)
+      printf '%s\n' "ca_bundle$US$bundle${US}count=$c sha256=$h"
+      if [ "$DEEP" = "1" ] && command -v openssl >/dev/null 2>&1; then
+        block=""
+        while IFS= read -r l; do
+          block="$block$l
+    "
+          case "$l" in
+            *"END CERTIFICATE"*)
+              info=$(printf '%s' "$block" | openssl x509 -noout -fingerprint -sha256 -subject 2>/dev/null)
+              fp=$(printf '%s' "$info" | sed -n 's/.*Fingerprint=//p' | tr -d ': ')
+              subj=$(printf '%s' "$info" | sed -n 's/^subject= *//p')
+              [ -n "$fp" ] && printf '%s\n' "ca_cert$US$fp$US$subj"
+              block="" ;;
+          esac
+        done < "$bundle"
+      fi
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_dns
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L15 stash dns_trust records
+  ansible.builtin.set_fact:
+    dw_raw_dns_trust: "{{ dw_dns.stdout | default('') }}"
+
+- name: L15 mark dns_trust failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['dns_trust'] }}"
+  when: (dw_dns.rc | default(1)) != 0
+
+# ---------------------------------------------------------------------- L16 shares
+- name: L16 collect NFS exports and SMB shares (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    for ef in /etc/exports /etc/exports.d/*.exports; do
+      [ -f "$ef" ] || continue
+      grep -vE '^[[:space:]]*(#|$)' "$ef" 2>/dev/null | while IFS= read -r el; do
+        el=${el%%#*}
+        exp=$(printf '%s' "$el" | awk '{print $1}')
+        opts=$(printf '%s' "$el" | cut -s -d' ' -f2- 2>/dev/null)
+        [ -n "$exp" ] && printf '%s\n' "nfs_export$US$exp$US$exp$US$opts"
+      done
+    done
+    if [ -f /etc/samba/smb.conf ]; then
+      awk -v US="$US" '
+        /^[[:space:]]*[;#]/ {next}
+        /^[[:space:]]*\[/ {
+          s=$0; gsub(/[][]/,"",s); gsub(/^[[:space:]]+|[[:space:]]+$/,"",s);
+          sect=tolower(s); next }
+        /^[[:space:]]*[Pp][Aa][Tt][Hh][[:space:]]*=/ {
+          v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); gsub(/[[:space:]]+$/,"",v);
+          if (sect!="global" && sect!="") print "smb_share" US sect US v US "" }
+      ' /etc/samba/smb.conf 2>/dev/null
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_shares
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L16 stash shares records
+  ansible.builtin.set_fact:
+    dw_raw_shares: "{{ dw_shares.stdout | default('') }}"
+
+- name: L16 mark shares failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['shares'] }}"
+  when: (dw_shares.rc | default(1)) != 0

@@ -1,0 +1,44 @@
+{
+  "meta": {
+    "schema_version": "1.0",
+    "host": "web01",
+    "platform": "linux",
+    "os": "RHEL 9.4",
+    "collected_at": "2026-07-22T04:00:12Z",
+    "collector_version": "driftwatch 0.1.0",
+    "engagement": "test-2026-07",
+    "run_id": "2026-07-22T0400Z",
+    "partial": false,
+    "failed_categories": [],
+    "collector_account": "svc-driftwatch"
+  },
+  "processes": [
+    {"path": "/usr/sbin/nginx", "sha256": "aaa", "user": "root", "args_norm": "nginx -g daemon off", "args": "nginx -g 'daemon off;'", "pid": 812, "ppid": 1, "started": "Mon Jul 21 03:00"},
+    {"path": "/usr/sbin/sshd", "sha256": "bbb", "user": "root", "args_norm": "sshd -D", "args": "/usr/sbin/sshd -D", "pid": 900, "ppid": 1, "started": "Mon Jul 21 03:00"},
+    {"path": "/usr/bin/backup", "sha256": "ccc", "user": "svc-driftwatch", "args_norm": "backup run", "args": "backup run", "pid": 950, "ppid": 1, "started": "Tue Jul 22 03:59"}
+  ],
+  "listening": [
+    {"proto": "tcp", "port": 22, "path": "/usr/sbin/sshd", "bind": "0.0.0.0", "pid": 900, "user": "root"},
+    {"proto": "tcp", "port": 443, "path": "/usr/sbin/nginx", "bind": "0.0.0.0", "pid": 812, "user": "root"}
+  ],
+  "users": [
+    {"name": "root", "uid": 0, "gid": 0, "shell": "/bin/bash", "home": "/root", "locked": false, "pw_last_set": "2026-01-01", "home_ctime": "2020-01-01", "last_login": "2026-07-22", "groups": ["root"]},
+    {"name": "alice", "uid": 1000, "gid": 1000, "shell": "/bin/bash", "home": "/home/alice", "locked": false, "pw_last_set": "2026-06-01", "home_ctime": "2026-06-01", "last_login": "2026-07-21", "groups": ["alice", "wheel"]}
+  ],
+  "ssh_config": {
+    "file_hash": "sshcfg1",
+    "permit_root_login": "no",
+    "password_authentication": "no",
+    "effective": {"permitrootlogin": "no", "passwordauthentication": "no"}
+  },
+  "persistence": [],
+  "dns_trust": [
+    {"kind": "ca_bundle", "key": "system", "value": "count=140"}
+  ],
+  "kernel_modules": [
+    {"name": "xfs", "sha256": "modxfs", "size": 100, "used_by": ""}
+  ],
+  "file_integrity": [
+    {"kind": "suid", "path": "/usr/bin/sudo", "sha256": "sudohash", "mode": "4755", "owner": "root", "suid": true}
+  ]
+}

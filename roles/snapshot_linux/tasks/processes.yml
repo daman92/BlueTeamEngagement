@@ -1,0 +1,67 @@
+---
+# tasks/processes.yml — L1 processes + L2 fileless indicators.
+# One read-only /proc walk feeds both categories. Emits US(0x1F)-delimited records:
+#   path | sha256 | user | pid | ppid | started | find_ind | find_detail | args
+# The template (snapshot.json.j2) splits these into the processes[] and fileless[]
+# field sets defined in CONTRACTS.md §3.1. Binaries are hashed only when the hash
+# policy warrants it (dw_snapshot_linux_do_hash), keeping the fast set cheap.
+
+- name: L1/L2 walk /proc for processes and fileless indicators (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    DO_HASH={{ (dw_snapshot_linux_do_hash | trim | bool) | ternary('1', '0') }}
+    MAX={{ dw_snapshot_linux_max_procs | int }}
+    n=0
+    for p in /proc/[0-9]*; do
+      [ -r "$p/stat" ] || continue
+      n=$((n + 1))
+      [ "$n" -gt "$MAX" ] && break
+      pid=${p#/proc/}
+      statline=$(cat "$p/stat" 2>/dev/null) || continue
+      comm=${statline#*(}; comm=${comm%%)*}
+      rest=${statline##*) }
+      # shellcheck disable=SC2086
+      set -- $rest
+      ppid=${2:-}
+      user=$(stat -c %U "$p" 2>/dev/null); [ -n "$user" ] || user="?"
+      started=$(stat -c %z "$p" 2>/dev/null)
+      exe=$(readlink "$p/exe" 2>/dev/null)
+      args=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null | tr '\n\t' '  ' | sed 's/[[:space:]]*$//')
+      ind=""; detail=""; path="$exe"
+      case "$exe" in
+        "")            path="[$comm]" ;;
+        memfd:*)       ind="memfd";       detail="$exe" ;;
+        *" (deleted)") ind="deleted_exe"; detail="$exe"; path=${exe% (deleted)} ;;
+      esac
+      if [ -z "$ind" ]; then
+        cnt=$(awk '($2 ~ /x/) && ($2 ~ /w/) && (NF==5){c++} END{if(c>0) print c}' "$p/maps" 2>/dev/null)
+        [ -n "$cnt" ] && { ind="anon_exec_map"; detail="rwx_anon_maps=$cnt"; }
+      fi
+      sha=""
+      if [ "$DO_HASH" = "1" ]; then
+        case "$path" in
+          /*) [ -f "$path" ] && sha=$(sha256sum "$path" 2>/dev/null | awk '{print $1}') ;;
+        esac
+      fi
+      [ -n "$args" ] || args="[$comm]"
+      printf '%s\n' "$path$US$sha$US$user$US$pid$US$ppid$US$started$US$ind$US$detail$US$args"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_ps
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L1/L2 stash raw process records
+  ansible.builtin.set_fact:
+    dw_raw_processes: "{{ dw_ps.stdout | default('') }}"
+
+- name: L1/L2 mark categories failed on collection error
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['processes', 'fileless'] }}"
+  when: (dw_ps.rc | default(1)) != 0

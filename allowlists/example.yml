@@ -1,0 +1,36 @@
+# driftwatch — worked allowlist example (CONTRACTS.md §5.3; design §6/§8)
+# =============================================================================
+# This file is a TEMPLATE / reference. Copy an entry, adapt it, and keep the
+# real suppressions in their own reviewed *.yml here — every *.yml in this
+# directory is loaded (scripts/diff_engine.py:load_allowlists).
+#
+# A suppression NEVER deletes a finding: a matched finding stays in the run's
+# NDJSON with `suppressed: true` and `suppressed_by: <id>`, and renders in the
+# report's suppression appendix (CONTRACTS §4). Nothing is hidden — it is
+# annotated as reviewed-and-accepted.
+#
+# The `match` block uses the SAME DSL as policy rules, evaluated against the
+# finding's detail.identity merged with detail.after, plus the synthetic fields
+# `category` and `platform` (diff_engine.apply_suppression). So you can key on
+# identity fields (task_path, name, ...), on attributes present in `after`, and
+# on category/platform.
+# =============================================================================
+
+entries:
+
+  # One fully-worked, currently-EXPIRING entry. The Chrome updater re-creates its
+  # own scheduled task on a machine GUID, so a fresh task appears on workstations
+  # every few days — benign churn confirmed against the software inventory.
+  - id: allow-chrome-autoupdate
+    reason: "Google Chrome updater re-registers GoogleUpdateTaskMachine* on a rolling schedule; benign churn confirmed against the approved software list"
+    approver: analyst-b
+    ticket: ACME-142
+    expires: "2026-10-31"          # REQUIRED — after this date the entry is ignored and a warning is logged
+    scope:
+      hosts: []                     # empty host + group scope = applies fleet-wide
+      groups: [win_workstations]    # ...but here we bound it to the workstation group
+    match:
+      all:
+        - {field: platform, op: eq, value: windows}
+        - {field: category, op: eq, value: scheduled_tasks}
+        - {field: task_path, op: regex, value: '^\\GoogleUpdateTask'}

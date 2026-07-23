@@ -1,0 +1,56 @@
+---
+# tasks/file_integrity.yml — L13 targeted file integrity (CONTRACTS §3.1 `file_integrity`)
+# identity: kind, path | other: sha256, mode, owner, suid (bool)
+# kind: suid | critical
+#
+# SUID/SGID inventory across the fixed standard paths (a NEW suid binary is
+# Critical — design L13); the binaries themselves are hashed only when the hash
+# gate is open. The small fixed critical set (hosts, resolv.conf, nsswitch, pam,
+# sudoers, ...) is ALWAYS hashed — it is a handful of files. Full-filesystem FIM
+# stays with AIDE/EDR. Record: kind | path | sha256 | mode | owner | suid
+
+- name: L13 collect SUID inventory and critical file hashes (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    DO_HASH={{ (dw_snapshot_linux_do_hash | trim | bool) | ternary('1', '0') }}
+
+    # -- SUID/SGID inventory in the standard paths ---------------------------
+    find {{ dw_snapshot_linux_suid_paths | join(' ') }} -xdev \
+        \( -perm -4000 -o -perm -2000 \) -type f 2>/dev/null \
+      | LC_ALL=C sort -u | while IFS= read -r f; do
+          mode=$(stat -c %04a "$f" 2>/dev/null)
+          owner=$(stat -c %U "$f" 2>/dev/null)
+          suid=false
+          case "$mode" in 4???|5???|6???|7???) suid=true ;; esac
+          sha=""
+          [ "$DO_HASH" = "1" ] && sha=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+          printf '%s\n' "suid$US$f$US$sha$US$mode$US$owner$US$suid"
+        done
+
+    # -- fixed critical set (always hashed — it is tiny) ---------------------
+    for f in {{ dw_snapshot_linux_critical_files | join(' ') }}; do
+      [ -f "$f" ] || continue
+      sha=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+      mode=$(stat -c %04a "$f" 2>/dev/null)
+      owner=$(stat -c %U "$f" 2>/dev/null)
+      printf '%s\n' "critical$US$f$US$sha$US$mode$US$owner${US}false"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_fint
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L13 stash file integrity records
+  ansible.builtin.set_fact:
+    dw_raw_file_integrity: "{{ dw_fint.stdout | default('') }}"
+
+- name: L13 mark file_integrity failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['file_integrity'] }}"
+  when: (dw_fint.rc | default(1)) != 0

@@ -1,0 +1,233 @@
+{# report.html.j2 — driftwatch per-run report (design §7). Rendered by scripts/report_gen.py. #}
+{%- set sev_order = ['critical', 'high', 'medium', 'low', 'info'] -%}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>driftwatch report — {{ engagement }} — {{ run_id }}</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1b1f24; --muted: #5b6673; --line: #e2e6ea;
+    --card: #f7f9fb; --code-bg: #eef1f4; --accent: #1f6feb;
+    --crit: #b91c1c; --high: #c2410c; --medium: #a16207; --low: #2563eb; --info: #4b5563;
+    --present: #15803d; --absent: #cbd2d9; --new: #7c3aed;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #9aa5b1; --line: #283039;
+      --card: #161b22; --code-bg: #21262d; --accent: #4c8dff;
+      --crit: #ff6b6b; --high: #ff9f5a; --medium: #e3c04b; --low: #6ea8ff; --info: #9aa5b1;
+      --present: #4ade80; --absent: #3a434d; --new: #b087f5;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1.25rem 4rem; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 1080px; margin-inline: auto;
+  }
+  h1 { font-size: 1.7rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1.25rem; margin: 2.5rem 0 .75rem; padding-bottom: .35rem; border-bottom: 2px solid var(--line); }
+  h3 { font-size: 1.02rem; margin: 1.4rem 0 .35rem; }
+  a { color: var(--accent); }
+  code, .mono { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-size: .85em; }
+  code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+  .sub { color: var(--muted); font-size: .9rem; }
+  .meta-line { color: var(--muted); margin: .1rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; font-size: .9rem; }
+  th, td { border: 1px solid var(--line); padding: .4rem .6rem; text-align: left; }
+  th { background: var(--card); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .scroll { overflow-x: auto; }
+  .pill {
+    display: inline-block; padding: .05rem .5rem; border-radius: 999px; font-size: .72rem;
+    font-weight: 700; letter-spacing: .02em; text-transform: uppercase; color: #fff;
+  }
+  .pill.critical { background: var(--crit); } .pill.high { background: var(--high); }
+  .pill.medium { background: var(--medium); } .pill.low { background: var(--low); }
+  .pill.info { background: var(--info); }
+  .pill.new { background: var(--new); }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-left-width: 4px;
+    border-radius: 8px; padding: .85rem 1rem; margin: .8rem 0;
+  }
+  .card.critical { border-left-color: var(--crit); } .card.high { border-left-color: var(--high); }
+  .card.medium { border-left-color: var(--medium); } .card.low { border-left-color: var(--low); }
+  .card.info { border-left-color: var(--info); }
+  .card .title { font-weight: 650; font-size: 1rem; }
+  .card .rule { color: var(--muted); font-size: .82rem; margin: .15rem 0 .5rem; }
+  .hosts { margin: .35rem 0; }
+  .delta-lines { margin: .5rem 0; padding: .5rem .7rem; background: var(--code-bg); border-radius: 6px; }
+  .delta-lines div { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: .82rem; white-space: pre-wrap; word-break: break-word; }
+  .delta-lines .add { color: var(--present); }
+  .delta-lines .del { color: var(--crit); }
+  .footnote { color: var(--muted); font-size: .82rem; margin-top: .4rem; }
+  .lenses { color: var(--muted); font-size: .82rem; }
+  .matrix td.cell { text-align: center; font-weight: 700; }
+  .matrix td.on { color: var(--present); } .matrix td.off { color: var(--absent); }
+  .matrix th.hostidx { text-align: center; font-variant-numeric: tabular-nums; }
+  .legend { font-size: .82rem; color: var(--muted); margin: .3rem 0 .6rem; }
+  .empty { color: var(--muted); font-style: italic; padding: .5rem 0; }
+  .kpis { display: flex; flex-wrap: wrap; gap: .6rem; margin: .6rem 0; }
+  .kpi { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: .5rem .9rem; min-width: 92px; }
+  .kpi .n { font-size: 1.4rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kpi .l { font-size: .74rem; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  .note { color: var(--muted); font-style: italic; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 2rem 0 0; }
+  @media print { body { max-width: none; } .card { break-inside: avoid; } }
+</style>
+</head>
+<body>
+
+<h1>driftwatch report — {{ engagement }}</h1>
+<div class="meta-line">Run <code>{{ run_id }}</code>{% if prev_run_id %} · Previous run <code>{{ prev_run_id }}</code>{% endif %} · Generated {{ generated_at }}</div>
+{% if client %}<div class="meta-line">Client: {{ client }}</div>{% endif %}
+{% if authorized_by %}<div class="meta-line">Authorized by: {{ authorized_by }}</div>{% endif %}
+<div class="meta-line">
+  Findings this run: <strong>{{ totals.active }}</strong> active{% if totals.suppressed %}, {{ totals.suppressed }} suppressed{% endif %}
+  — {% for s in sev_order %}<span class="pill {{ s }}">{{ totals.by_severity[s] }} {{ s }}</span> {% endfor %}
+</div>
+
+<h2>1. Run health</h2>
+{% set rh = run_health %}
+{% if rh.available %}
+<div class="kpis">
+  <div class="kpi"><div class="n">{{ rh.targeted }}</div><div class="l">Targeted</div></div>
+  <div class="kpi"><div class="n">{{ rh.collected }}</div><div class="l">Collected</div></div>
+  <div class="kpi"><div class="n">{{ rh.partial }}</div><div class="l">Partial</div></div>
+  <div class="kpi"><div class="n">{{ rh.unreachable }}</div><div class="l">Unreachable</div></div>
+  <div class="kpi"><div class="n">{{ rh.no_transport | length }}</div><div class="l">No transport</div></div>
+  <div class="kpi"><div class="n">{{ rh.t3_only | length }}</div><div class="l">T3-only</div></div>
+</div>
+{% if rh.unreachable or rh.no_transport or rh.t3_only or rh.partial %}
+<p class="note">Unreachable, no-transport, partial, and T3-only hosts are authorized but not fully assessed, and are reported as coverage-gap findings below — never silently omitted.</p>
+{% endif %}
+<ul>
+{% for hr in rh.host_rows if hr.status == 'unreachable' %}<li><strong>Unreachable:</strong> {{ hr.host }}{% if hr.platform %} ({{ hr.platform }}){% endif %}</li>
+{% endfor %}
+{% for hr in rh.host_rows if hr.status == 'partial' %}<li><strong>Partial:</strong> {{ hr.host }}{% if hr.failed_categories %} — failed: {{ hr.failed_categories | join(', ') }}{% endif %}</li>
+{% endfor %}
+{% if rh.no_transport %}<li><strong>No transport (Windows):</strong> {{ rh.no_transport | join(', ') }}</li>{% endif %}
+{% if rh.t3_only %}<li><strong>T3-only (network):</strong> {{ rh.t3_only | join(', ') }}</li>{% endif %}
+</ul>
+{% else %}
+<p class="note">No run-status file (<code>snapshots/_run/{{ run_id }}.json</code>) was present, so per-host collection status could not be read directly. The figures below are reconstructed from coverage-gap findings; <em>collected</em> cannot be determined without the status file.</p>
+<div class="kpis">
+  <div class="kpi"><div class="n">{{ rh.targeted }}</div><div class="l">Hosts in findings</div></div>
+  <div class="kpi"><div class="n">{{ rh.partial }}</div><div class="l">Partial</div></div>
+  <div class="kpi"><div class="n">{{ rh.unreachable }}</div><div class="l">Unreachable</div></div>
+  <div class="kpi"><div class="n">{{ rh.no_transport | length }}</div><div class="l">No transport</div></div>
+  <div class="kpi"><div class="n">{{ rh.t3_only | length }}</div><div class="l">T3-only</div></div>
+</div>
+{% endif %}
+
+<h2>2. Executive delta</h2>
+{% if delta.prev_available %}
+<p class="sub">Active finding counts by severity vs previous run <code>{{ delta.prev_run_id }}</code> (Δ = this run − previous).</p>
+<div class="scroll"><table>
+  <thead><tr><th>Severity</th><th class="num">This run</th><th class="num">Previous</th><th class="num">Δ</th></tr></thead>
+  <tbody>
+  {% for r in delta.rows %}<tr><td><span class="pill {{ r.severity }}">{{ r.severity }}</span></td><td class="num">{{ r.current }}</td><td class="num">{{ r.previous }}</td><td class="num">{{ '%+d' | format(r.delta) }}</td></tr>
+  {% endfor %}
+  <tr><td><strong>total</strong></td><td class="num"><strong>{{ delta.total_current }}</strong></td><td class="num"><strong>{{ delta.total_previous }}</strong></td><td class="num"><strong>{{ '%+d' | format(delta.total_current - delta.total_previous) }}</strong></td></tr>
+  </tbody>
+</table></div>
+{% else %}
+<p class="sub">No previous run was found — this is a first-run baseline (no delta).</p>
+<div class="scroll"><table>
+  <thead><tr><th>Severity</th><th class="num">This run</th></tr></thead>
+  <tbody>{% for r in delta.rows %}<tr><td><span class="pill {{ r.severity }}">{{ r.severity }}</span></td><td class="num">{{ r.current }}</td></tr>
+  {% endfor %}<tr><td><strong>total</strong></td><td class="num"><strong>{{ delta.total_current }}</strong></td></tr></tbody>
+</table></div>
+{% endif %}
+
+<h3>New this run ({{ delta.new_count }})</h3>
+{% if delta.new_this_run %}
+<p class="sub">First seen in <code>{{ run_id }}</code> (<code>first_seen == {{ run_id }}</code>), most severe first.</p>
+<ul>
+{% for f in delta.new_this_run %}<li><span class="pill {{ f.severity }}">{{ f.severity }}</span> <code>{{ f.rule }}</code> — {{ f.headline }} · {{ f.host_count }} host{{ 's' if f.host_count != 1 else '' }} ({{ f.hosts_str }})</li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="empty">No findings are new this run — every active finding was first seen in an earlier run.</p>
+{% endif %}
+
+<h2>3. Findings by severity</h2>
+{% if severity_sections %}
+{% for section in severity_sections %}
+{% for f in section.findings %}
+<div class="card {{ f.severity }}">
+  <div class="title"><span class="pill {{ f.severity }}">{{ f.severity }}</span> {{ f.headline }}{% if f.new_this_run %} <span class="pill new">new</span>{% endif %}</div>
+  <div class="rule">rule <code>{{ f.rule }}</code> · <code>{{ f.finding_id }}</code> · {{ f.platform }}/{{ f.category }} · {{ f.change_type }}</div>
+  <div class="hosts"><strong>Hosts ({{ f.host_scope }}):</strong> {{ f.hosts_str }}</div>
+  <div class="delta-lines">
+  {% for line in f.change_lines %}<div class="{{ 'add' if line.startswith('+') else ('del' if line.startswith('-') else '') }}">{{ line }}</div>{% endfor %}
+  </div>
+  <div class="lenses">First seen {{ f.first_seen }} · {{ f.lens_labels | join(' · ') }}{% if f.prevalence_pct %} · fleet prevalence {{ f.prevalence_pct }}{% endif %}</div>
+  {% if f.note %}<div class="footnote">{{ f.note }}</div>{% endif %}
+  {% if f.per_host %}
+  <div class="footnote">Per-host detail (values diverge across hosts):</div>
+  <div class="delta-lines">{% for host, after in f.per_host | dictsort %}<div>{{ host }}: {{ after | tojson }}</div>{% endfor %}</div>
+  {% endif %}
+</div>
+{% endfor %}
+{% endfor %}
+{% else %}
+<p class="empty">No active findings this run. Every category compared clean across the temporal, baseline, fleet-outlier, and policy lenses.</p>
+{% endif %}
+
+<h2>4. Fleet matrix</h2>
+{% if matrix.rows and matrix.hosts %}
+<p class="sub">Findings × hosts — the direct answer to "which machines have which differences." <span class="matrix"><span class="on">●</span></span> present, <span class="matrix"><span class="off">·</span></span> absent.</p>
+<div class="legend">{% for h in matrix.hosts %}<strong>{{ loop.index }}</strong>&nbsp;{{ h }}{% if not loop.last %} &nbsp;·&nbsp; {% endif %}{% endfor %}</div>
+<div class="scroll"><table class="matrix">
+  <thead><tr><th>Sev</th><th>Finding</th><th>Rule</th>{% for h in matrix.hosts %}<th class="hostidx" title="{{ h }}">{{ loop.index }}</th>{% endfor %}<th class="num">n</th></tr></thead>
+  <tbody>
+  {% for row in matrix.rows %}<tr>
+    <td><span class="pill {{ row.severity }}">{{ row.severity }}</span></td>
+    <td><code>{{ row.finding_id }}</code></td>
+    <td><code>{{ row.rule }}</code></td>
+    {% for h in matrix.hosts %}<td class="cell {{ 'on' if row.cells[h] else 'off' }}">{{ '●' if row.cells[h] else '·' }}</td>{% endfor %}
+    <td class="num">{{ row.present_count }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">No findings to place in the matrix this run.</p>
+{% endif %}
+
+<h2>5. Per-host appendix</h2>
+{% if per_host %}
+<p class="sub">Every active finding touching a given host, for the responder assigned to that box.</p>
+{% for host in per_host %}
+<h3>{{ host.host }}{% if host.platform %} <span class="sub">({{ host.platform }})</span>{% endif %} — {{ host.count }} finding{{ 's' if host.count != 1 else '' }}</h3>
+<div class="sub">{% for s in sev_order %}{% if host.by_severity[s] %}<span class="pill {{ s }}">{{ host.by_severity[s] }} {{ s }}</span> {% endif %}{% endfor %}</div>
+<ul>
+{% for f in host.findings %}<li><span class="pill {{ f.severity }}">{{ f.severity }}</span> <code>{{ f.rule }}</code> — {{ f.headline }} · <code>{{ f.finding_id }}</code>{% if f.new_this_run %} <span class="pill new">new</span>{% endif %}<br>
+<span class="mono">{% if f.per_host and f.per_host[host.host] is defined %}{{ '+' if f.change_type in ['added', 'coverage_gap'] else '~' }} {{ f.per_host[host.host] | tojson }}{% else %}{% for line in f.change_lines %}{{ line }}{% if not loop.last %} ; {% endif %}{% endfor %}{% endif %}</span></li>
+{% endfor %}
+</ul>
+{% endfor %}
+{% else %}
+<p class="empty">No host has any active finding this run.</p>
+{% endif %}
+
+<h2>Appendix — Suppressed findings</h2>
+{% if suppressed %}
+<p class="sub">These findings matched an active allowlist entry and are suppressed from the counts above. They are retained here and never dropped (design §6).</p>
+<ul>
+{% for f in suppressed %}<li><span class="pill {{ f.severity }}">{{ f.severity }}</span> <code>{{ f.rule }}</code> — {{ f.headline }} · <code>{{ f.finding_id }}</code><br>
+<span class="sub">Suppressed by <code>{{ f.suppressed_by }}</code> · Hosts ({{ f.host_count }}): {{ f.hosts_str }} · first seen {{ f.first_seen }}</span></li>
+{% endfor %}
+</ul>
+{% else %}
+<p class="empty">No findings were suppressed this run.</p>
+{% endif %}
+
+<hr>
+<p class="footnote">Generated by driftwatch report_gen from <code>findings/{{ run_id }}.ndjson</code> (canonical output). This HTML is a rendering; the NDJSON is the source of truth (design §7).</p>
+
+</body>
+</html>

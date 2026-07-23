@@ -1,0 +1,840 @@
+#!/usr/bin/env bash
+#
+# driftwatch — operator console for the blue-team baseline & drift-detection kit.
+# One vocabulary the operator learns; underneath, the read-only collector and the
+# response layer stay separate privilege domains that meet only at the case (design §14).
+#
+# Runs on the Linux kit control node. Verbs (CONTRACTS.md §8):
+#   new-engagement <id>            create an engagement volume from the template
+#   preflight                      Kerberos prereqs + Windows transport matrix
+#   collect [--deep] [--limit P]   scope-gate -> snapshot -> diff -> report
+#   diff [--run-id R]              normalize + diff engine on the control node
+#   report [--run-id R]            render Markdown + HTML report
+#   ship [--run-id R]              push findings to the kit SIEM (Splunk/Security Onion)
+#   baseline promote <host> <run_id> [--ticket T]
+#   respond <propose|approve|rollback> ...   thin passthrough to the response layer
+#   status                         read-only engagement dashboard
+#   teardown [--retain a,b,...]    shred the volume (report kept by default; vault ALWAYS)
+#
+# Engagement is resolved from `--engagement <id>` or $DRIFTWATCH_ENGAGEMENT; it is an
+# ERROR to have neither (the tool never guesses which client it is pointed at).
+set -euo pipefail
+
+# --------------------------------------------------------------------------- locations
+SELF="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")"
+BIN_DIR="$(dirname "$SELF")"
+REPO_ROOT="$(cd "$BIN_DIR/.." >/dev/null 2>&1 && pwd)"
+SCRIPTS_DIR="$REPO_ROOT/scripts"
+PLAYBOOKS_DIR="$REPO_ROOT/playbooks"
+RULES_DIR="$REPO_ROOT/rules"
+ALLOWLISTS_DIR="$REPO_ROOT/allowlists"
+RESPOND_PY="$REPO_ROOT/response/scripts/respond.py"
+export ANSIBLE_CONFIG="${ANSIBLE_CONFIG:-$REPO_ROOT/ansible.cfg}"
+
+PROG="driftwatch"
+OPERATOR="${DRIFTWATCH_OPERATOR:-$(id -un 2>/dev/null || echo unknown)}"
+
+# Per-invocation scratch, always cleaned up (may hold resolved target IPs).
+DW_TMP="$(mktemp -d "${TMPDIR:-/tmp}/driftwatch.XXXXXX")"
+cleanup() { rm -rf "$DW_TMP"; }
+trap cleanup EXIT
+
+ENGAGEMENT=""
+ENGAGEMENT_DIR=""
+
+# --------------------------------------------------------------------------- output
+_tty() { [ -t 2 ]; }
+_col() { if _tty; then printf '\033[%sm' "$1" >&2; fi; }
+info() { _col '0;36'; printf '[%s] ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+warn() { _col '0;33'; printf '[%s] WARN: ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+err()  { _col '0;31'; printf '[%s] ERROR: ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+iso_now()     { date -u +%Y-%m-%dT%H:%M:%SZ; }
+make_run_id() { date -u +%Y-%m-%dT%H%MZ; }   # one collection cycle = one run_id fleet-wide
+
+require_cmds() {
+  local missing=()
+  local c
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  [ "${#missing[@]}" -eq 0 ] || die "required command(s) not found on the kit: ${missing[*]}"
+}
+
+# --------------------------------------------------------------------------- engagement
+resolve_engagement() {
+  [ -n "$ENGAGEMENT" ] || ENGAGEMENT="${DRIFTWATCH_ENGAGEMENT:-}"
+  [ -n "$ENGAGEMENT" ] || die "no engagement selected — pass --engagement <id> or set DRIFTWATCH_ENGAGEMENT"
+  ENGAGEMENT_DIR="$REPO_ROOT/engagements/$ENGAGEMENT"
+  [ -d "$ENGAGEMENT_DIR" ] || die "engagement '$ENGAGEMENT' not found at $ENGAGEMENT_DIR (create it with: $PROG new-engagement $ENGAGEMENT)"
+  export DRIFTWATCH_ENGAGEMENT="$ENGAGEMENT"
+  export DRIFTWATCH_ENGAGEMENT_DIR="$ENGAGEMENT_DIR"
+}
+
+# audit.log: one line per verb — "<ISO8601> | <verb> | <run_id> | <operator> | <outcome>"
+audit() {
+  local verb="$1" run_id="$2" outcome="$3"
+  [ -n "$ENGAGEMENT_DIR" ] || return 0
+  printf '%s | %s | %s | %s | %s\n' "$(iso_now)" "$verb" "$run_id" "$OPERATOR" "$outcome" \
+    >>"$ENGAGEMENT_DIR/audit.log"
+}
+
+# Read a dotted path out of scope.yml with a default. PyYAML is a control-node dependency.
+scope_get() {
+  python3 - "$ENGAGEMENT_DIR/scope.yml" "$1" "${2:-}" <<'PY'
+import sys
+try:
+    import yaml
+    d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+except Exception:
+    print(sys.argv[3]); sys.exit(0)
+cur = d
+for part in sys.argv[2].split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        cur = None
+        break
+print(sys.argv[3] if cur is None else cur)
+PY
+}
+
+# Latest run_id in this engagement (run_ids sort lexicographically = chronologically).
+latest_run_id() {
+  local d="$ENGAGEMENT_DIR/snapshots/_run"
+  [ -d "$d" ] || return 0
+  local f
+  f="$(ls "$d"/*.json 2>/dev/null | sort | tail -n1 || true)"
+  [ -n "$f" ] || return 0
+  basename "$f" .json
+}
+
+# --------------------------------------------------------------------------- target resolution
+# Resolve the hosts matching an Ansible pattern to a JSON list of {name, ip}, using the
+# host's ansible_host (the scope IP). scope_gate keys off IPs and fails closed on anything
+# it cannot prove is in scope, so a host without an IP simply aborts the run — as intended.
+build_targets_file() {
+  local pattern="${1:-all}" out="$2"
+  local inv="$ENGAGEMENT_DIR/inventory/hosts.yml"
+  [ -f "$inv" ] || die "no inventory at $inv — run: python3 $SCRIPTS_DIR/scope_gate.py generate --engagement-dir $ENGAGEMENT_DIR"
+
+  local listing=""
+  listing="$(ansible "$pattern" -i "$inv" --list-hosts 2>/dev/null || true)"
+  printf '%s\n' "$listing" | awk 'NR>1 && NF {print $1}' >"$DW_TMP/_hostnames"
+
+  ansible-inventory -i "$inv" --list >"$DW_TMP/_inv.json" 2>/dev/null || echo '{}' >"$DW_TMP/_inv.json"
+
+  python3 - "$DW_TMP/_hostnames" "$DW_TMP/_inv.json" "$out" <<'PY'
+import json, sys
+hosts = [ln.strip() for ln in open(sys.argv[1], encoding="utf-8") if ln.strip()]
+try:
+    inv = json.load(open(sys.argv[2], encoding="utf-8"))
+except Exception:
+    inv = {}
+hv = inv.get("_meta", {}).get("hostvars", {})
+# Direct group membership per host (used later to tell host-snapshot assets apart from
+# AD-enrichment-only hosts). scope_gate ignores keys other than ip/name.
+groups_by_host = {}
+for gname, gdata in inv.items():
+    if gname in ("_meta", "all") or not isinstance(gdata, dict):
+        continue
+    for h in gdata.get("hosts", []) or []:
+        groups_by_host.setdefault(h, set()).add(gname)
+targets = [{"name": h,
+            "ip": (hv.get(h, {}).get("ansible_host") or h),
+            "groups": sorted(groups_by_host.get(h, []))} for h in hosts]
+json.dump(targets, open(sys.argv[3], "w", encoding="utf-8"))
+print(len(targets))
+PY
+}
+
+# Run the scope pre-flight gate (layer 2) over a target file BEFORE any play. Any target
+# not affirmatively in-scope aborts the whole run and is appended to audit.log by scope_gate.
+scope_gate_or_abort() {
+  local targets="$1" verb="$2" run_id="$3"
+  if ! python3 "$SCRIPTS_DIR/scope_gate.py" assert-run \
+        --engagement-dir "$ENGAGEMENT_DIR" --targets-file "$targets" --operator "$OPERATOR"; then
+    audit "$verb" "$run_id" "SCOPE-ABORT"
+    die "scope gate refused this run — out-of-scope or ambiguous target(s); see audit.log"
+  fi
+}
+
+# Build snapshots/_run/<run_id>.json from the play recap + snapshot meta + transport matrix.
+# Schema is exactly what diff_engine.coverage_gaps() consumes.
+build_run_status() {
+  local run_id="$1" targets="$2" recap="$3"
+  python3 - "$ENGAGEMENT_DIR" "$run_id" "$targets" "$recap" <<'PY'
+import glob, json, os, re, sys
+from datetime import datetime, timezone
+
+eng_dir, run_id, targets_path, recap_path = sys.argv[1:5]
+snap = os.path.join(eng_dir, "snapshots")
+tm_path = os.path.join(eng_dir, "preflight", "transport_matrix.json")
+
+targets = json.load(open(targets_path, encoding="utf-8"))
+names = [t["name"] for t in targets]
+
+# Group membership per host: union of the scope-declared groups (fleet_groups.json — the
+# authoritative Python-side map, CONTRACTS §1.2) and the direct groups captured from the
+# inventory listing. Drives the platform label on coverage-gap findings (must be one of
+# linux|windows|network|ad) and tells host-snapshot assets apart from AD-enrichment-only
+# hosts, whose document lives at snapshots/_domain_<fqdn>/, not snapshots/<host>/.
+try:
+    fleet_groups = json.load(open(os.path.join(eng_dir, "inventory", "fleet_groups.json"),
+                                  encoding="utf-8"))
+except Exception:
+    fleet_groups = {}
+groups_by_name = {t["name"]: set(t.get("groups") or []) | set(fleet_groups.get(t["name"], []))
+                  for t in targets}
+
+def platform_of(groups):
+    for g in ("network", "windows", "linux", "ad"):
+        if g in groups:
+            return g
+    return "linux"   # diff_engine's own default for hosts with no platform group
+
+ad_only = {n for n in names
+           if "ad" in groups_by_name.get(n, set())
+           and not ({"linux", "windows", "network"} & groups_by_name.get(n, set()))}
+domain_docs = sorted(glob.glob(os.path.join(snap, "_domain_*", run_id + ".json")))
+
+# Parse the Ansible PLAY RECAP lines for unreachable/failed counts.
+recap = {}
+if os.path.exists(recap_path):
+    txt = open(recap_path, encoding="utf-8", errors="replace").read()
+    for m in re.finditer(r'^(\S+)\s*:\s*ok=\d+.*?unreachable=(\d+).*?failed=(\d+)', txt, re.M):
+        recap[m.group(1)] = {"unreachable": int(m.group(2)), "failed": int(m.group(3))}
+
+# Transport matrix -> hosts with no viable transport (kept out of the plain unreachable
+# bucket so the report distinguishes "no path" from "we have a path but it broke").
+no_transport = []
+tm = {}
+if os.path.exists(tm_path):
+    try:
+        tm = json.load(open(tm_path, encoding="utf-8")).get("hosts", {})
+    except Exception:
+        tm = {}
+for h, meta in tm.items():
+    if meta.get("transport") == "unreachable" and h in names:
+        no_transport.append(h)
+
+hosts = {}
+t3_only = []
+for name in names:
+    if name in no_transport:
+        continue
+    snap_file = os.path.join(snap, name, run_id + ".json")
+    if os.path.exists(snap_file):
+        try:
+            meta = json.load(open(snap_file, encoding="utf-8")).get("meta", {})
+        except Exception:
+            meta = {}
+        platform = meta.get("platform", "linux")
+        if meta.get("partial"):
+            hosts[name] = {"status": "partial", "platform": platform,
+                           "failed_categories": meta.get("failed_categories", [])}
+        else:
+            hosts[name] = {"status": "ok", "platform": platform, "failed_categories": []}
+        if platform == "network" and meta.get("collection_tier") == "T3":
+            t3_only.append(name)
+    elif name in ad_only:
+        # AD-enrichment-only host: its output is the per-domain document at
+        # snapshots/_domain_<fqdn>/<run_id>.json (CONTRACTS §2), never snapshots/<host>/.
+        if len(ad_only) == 1 and len(domain_docs) == 1:
+            try:
+                meta = json.load(open(domain_docs[0], encoding="utf-8")).get("meta", {})
+            except Exception:
+                meta = {}
+            if meta.get("partial"):
+                hosts[name] = {"status": "partial", "platform": "ad",
+                               "failed_categories": meta.get("failed_categories", [])}
+            else:
+                hosts[name] = {"status": "ok", "platform": "ad", "failed_categories": []}
+        elif domain_docs:
+            # Multiple domains this run: a host<->domain mapping is ambiguous here, but at
+            # least one enrichment document exists — report collection as achieved.
+            hosts[name] = {"status": "ok", "platform": "ad", "failed_categories": []}
+        else:
+            hosts[name] = {"status": "unreachable", "platform": "ad", "failed_categories": []}
+    else:
+        # No snapshot produced and no declared no-transport => unreachable at collection time.
+        hosts[name] = {"status": "unreachable",
+                       "platform": platform_of(groups_by_name.get(name, set())),
+                       "failed_categories": []}
+
+out = {
+    "run_id": run_id,
+    "engagement": os.path.basename(eng_dir),
+    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "hosts": hosts,
+    "no_transport": sorted(set(no_transport)),
+    "t3_only": sorted(set(t3_only)),
+}
+os.makedirs(os.path.join(snap, "_run"), exist_ok=True)
+with open(os.path.join(snap, "_run", run_id + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+    json.dump(out, fh, indent=2, sort_keys=True)
+
+ok = sum(1 for v in hosts.values() if v["status"] == "ok")
+partial = sum(1 for v in hosts.values() if v["status"] == "partial")
+unreach = sum(1 for v in hosts.values() if v["status"] == "unreachable")
+print(f"ok={ok} partial={partial} unreachable={unreach} "
+      f"no_transport={len(no_transport)} t3_only={len(set(t3_only))}")
+PY
+}
+
+# --------------------------------------------------------------------------- control-node pipeline
+do_diff() {
+  local run_id="$1"
+  [ -n "$run_id" ] || die "diff: no run to diff (collect first, or pass --run-id)"
+  require_cmds python3
+  info "normalize + diff for run $run_id"
+  python3 "$SCRIPTS_DIR/normalize.py" normalize --engagement-dir "$ENGAGEMENT_DIR" --run-id "$run_id"
+  python3 "$SCRIPTS_DIR/diff_engine.py" run --engagement-dir "$ENGAGEMENT_DIR" --run-id "$run_id" \
+    --rules-dir "$RULES_DIR" --allowlists-dir "$ALLOWLISTS_DIR"
+}
+
+do_report() {
+  local run_id="$1"
+  [ -n "$run_id" ] || die "report: no run to render (collect first, or pass --run-id)"
+  require_cmds python3
+  info "render report for run $run_id"
+  python3 "$SCRIPTS_DIR/report_gen.py" render --engagement-dir "$ENGAGEMENT_DIR" --run-id "$run_id" --format md,html
+  info "report written: $ENGAGEMENT_DIR/reports/$run_id.md (+ .html)"
+}
+
+# --------------------------------------------------------------------------- verbs
+write_scope_template() {
+  local path="$1" id="$2"
+  cat >"$path" <<EOF
+# driftwatch engagement scope — THE authorization rail (CONTRACTS.md §1.4, design §15.2).
+# Hosts enter the inventory ONLY via in_scope. Fail-closed: an empty in_scope authorizes
+# nothing. Fill this out, then generate the inventory:
+#   python3 scripts/scope_gate.py generate --engagement-dir engagements/$id
+engagement: $id
+client: "CHANGE ME — Client legal name"
+authorized_by: "CHANGE ME — name, title, signed SOW reference + date"   # free text, REQUIRED
+
+in_scope:                       # ONLY source of inventory. CIDRs declare a range; host/ip
+                                # entries become addressable machines. Discovery != access:
+                                # add a discovered host here deliberately before touching it.
+  # - cidr: 10.10.0.0/16
+  #   groups: [linux]
+  # - host: dc01.$id.example
+  #   ip: 10.10.1.5
+  #   groups: [windows, win_servers, ad, crown_jewels]
+
+deny:                           # explicit never-touch; wins over in_scope
+  # - cidr: 10.10.99.0/24
+
+oob_subnets: []                 # devices NOT in these are assumed in-band (design §13.5)
+
+settings:
+  hash_policy: tiered           # full | tiered | servers_only  (Appendix C.2)
+  collector_account: svc-driftwatch     # tagged collector_self by the normalizer
+  outlier_max_prevalence: 0.05  # fleet-outlier: item on < 5% ...
+  outlier_min_group: 20         #   ... of a group with >= 20 members
+  fast_interval: 2h             # informational; systemd timers document their own cadence
+  deep_interval: 24h
+  splunk_hec_url: ""            # empty = Splunk shipping disabled
+  splunk_hec_token_var: vault_splunk_hec_token   # NAME of the vault var, never the secret
+  elastic_url: ""              # empty = Security Onion / Elastic shipping disabled
+EOF
+}
+
+cmd_new_engagement() {
+  local id="${1:-}"
+  [ -n "$id" ] || die "usage: $PROG new-engagement <engagement_id>   (format: <client>-<yyyy>-<mm>, e.g. acme-2026-07)"
+  printf '%s' "$id" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?-[0-9]{4}-[0-9]{2}$' \
+    || warn "engagement id '$id' does not match <client>-<yyyy>-<mm> — continuing anyway"
+
+  local dir="$REPO_ROOT/engagements/$id"
+  [ -e "$dir" ] && die "engagement already exists: $dir"
+
+  mkdir -p \
+    "$dir/inventory" "$dir/vault" "$dir/preflight" \
+    "$dir/snapshots/_run" "$dir/configs" "$dir/baselines" \
+    "$dir/findings" "$dir/cases" "$dir/evidence" "$dir/reports" \
+    "$dir/audit/hostlogs"
+  chmod 700 "$dir/vault"                 # credentials never leave this directory
+  : >"$dir/audit.log"
+  write_scope_template "$dir/scope.yml" "$id"
+
+  # Per-engagement git repo for tamper-evident snapshot history (design §5). It lives INSIDE
+  # the engagement volume (which the root .gitignore excludes), so it is shredded with the
+  # volume at teardown and never mixes with the tool repo's history.
+  if command -v git >/dev/null 2>&1; then
+    ( cd "$dir" \
+        && git init -q \
+        && printf 'vault/\n.factcache/\n.retry/\n*.lock\n' >.gitignore \
+    ) || warn "per-engagement git init failed (non-fatal — tamper-evidence history unavailable)"
+  fi
+
+  ENGAGEMENT="$id"; ENGAGEMENT_DIR="$dir"
+  audit "new-engagement" "-" "created"
+  info "created engagement volume: $dir"
+  cat >&2 <<EOF
+
+Next steps:
+  1. Edit ${dir#$REPO_ROOT/}/scope.yml — set authorized_by and in_scope (this IS the authorization boundary).
+  2. Load the handed-over credentials into the ephemeral vault:
+       ansible-vault create ${dir#$REPO_ROOT/}/vault/vault.yml
+  3. Generate the fail-closed inventory from scope:
+       python3 scripts/scope_gate.py generate --engagement-dir ${dir#$REPO_ROOT/}
+  4. Verify transports (DNS/clock/TGT + WinRM/OpenSSH):
+       DRIFTWATCH_ENGAGEMENT=$id $PROG preflight
+EOF
+}
+
+cmd_preflight() {
+  resolve_engagement
+  require_cmds ansible ansible-playbook ansible-inventory python3
+  local run_id; run_id="$(make_run_id)"
+
+  # Preflight probes Windows hosts, so it too passes through the scope gate first.
+  build_targets_file "windows" "$DW_TMP/targets.json" >/dev/null
+  scope_gate_or_abort "$DW_TMP/targets.json" "preflight" "$run_id"
+
+  info "preflight run_id=$run_id — checking DNS-at-DC, clock skew (<5m), TGT, WinRM/OpenSSH"
+  local rc=0
+  ansible-playbook "$PLAYBOOKS_DIR/preflight.yml" \
+    -i "$ENGAGEMENT_DIR/inventory/hosts.yml" \
+    -e "dw_engagement=$ENGAGEMENT" \
+    -e "dw_engagement_dir=$ENGAGEMENT_DIR" \
+    -e "dw_run_id=$run_id" \
+    || rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    audit "preflight" "$run_id" "prereq-fail rc=$rc"
+    die "preflight FAILED — resolve the remediation items printed above before collecting"
+  fi
+  audit "preflight" "$run_id" "ok"
+  info "transport matrix: $ENGAGEMENT_DIR/preflight/transport_matrix.json"
+}
+
+cmd_collect() {
+  local deep=false limit="" collect_only=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --deep)                    deep=true; shift ;;
+      --limit)                   limit="${2:-}"; [ -n "$limit" ] || die "--limit needs a PATTERN"; shift 2 ;;
+      --limit=*)                 limit="${1#*=}"; shift ;;
+      --collect-only|--no-report) collect_only=true; shift ;;
+      *) die "collect: unknown option '$1'" ;;
+    esac
+  done
+
+  resolve_engagement
+  require_cmds ansible ansible-playbook ansible-inventory python3
+
+  local run_id; run_id="$(make_run_id)"
+  local hash_policy; hash_policy="$(scope_get settings.hash_policy tiered)"
+  local pattern="${limit:-all}"
+
+  # Prevent overlapping runs (systemd fast/deep/network timers can fire close together).
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$ENGAGEMENT_DIR/.collect.lock"
+    flock -n 9 || die "another collect is already running for '$ENGAGEMENT' (lock held)"
+  fi
+
+  # --- SCOPE GATE (layer 2) — BEFORE ANY PLAY ---
+  build_targets_file "$pattern" "$DW_TMP/targets.json" >/dev/null
+  scope_gate_or_abort "$DW_TMP/targets.json" "collect" "$run_id"
+
+  local ev=(
+    -e "dw_engagement=$ENGAGEMENT"
+    -e "dw_engagement_dir=$ENGAGEMENT_DIR"
+    -e "dw_run_id=$run_id"
+    -e "dw_snapshot_dir=$ENGAGEMENT_DIR/snapshots"
+    -e "dw_deep=$deep"
+    -e "dw_hash_policy=$hash_policy"
+    -e "dw_transport_matrix=$ENGAGEMENT_DIR/preflight/transport_matrix.json"
+  )
+  local limit_args=()
+  [ -n "$limit" ] && limit_args=(--limit "$limit")
+
+  local recap="$DW_TMP/recap.log"
+  local overall_rc=0
+
+  info "collect run_id=$run_id deep=$deep hash_policy=$hash_policy pattern=$pattern operator=$OPERATOR"
+
+  # Host snapshots (linux / windows / ad).
+  ansible-playbook "$PLAYBOOKS_DIR/snapshot.yml" \
+    -i "$ENGAGEMENT_DIR/inventory/hosts.yml" "${ev[@]}" "${limit_args[@]}" \
+    2>&1 | tee -a "$recap" || overall_rc=$?
+
+  # Network snapshots.
+  ansible-playbook "$PLAYBOOKS_DIR/snapshot_network.yml" \
+    -i "$ENGAGEMENT_DIR/inventory/hosts.yml" "${ev[@]}" "${limit_args[@]}" \
+    2>&1 | tee -a "$recap" || overall_rc=$?
+
+  # Record the run status (drives coverage-gap findings in the diff engine).
+  local summary
+  summary="$(build_run_status "$run_id" "$DW_TMP/targets.json" "$recap")" || summary="(status build failed)"
+  info "collection recap: $summary"
+  audit "collect" "$run_id" "collected rc=$overall_rc $summary"
+
+  if [ "$collect_only" = true ]; then
+    info "collect-only: skipping diff/report"
+    printf '%s\n' "$run_id"
+    return 0
+  fi
+
+  do_diff "$run_id"
+  do_report "$run_id"
+  printf '%s\n' "$run_id"
+}
+
+cmd_diff() {
+  resolve_engagement
+  local run_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id)   run_id="${2:-}"; shift 2 ;;
+      --run-id=*) run_id="${1#*=}"; shift ;;
+      *) die "diff: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$run_id" ] || run_id="$(latest_run_id)"
+  [ -n "$run_id" ] || die "diff: no runs found — collect first"
+  do_diff "$run_id"
+  audit "diff" "$run_id" "ok"
+}
+
+cmd_report() {
+  resolve_engagement
+  local run_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id)   run_id="${2:-}"; shift 2 ;;
+      --run-id=*) run_id="${1#*=}"; shift ;;
+      *) die "report: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$run_id" ] || run_id="$(latest_run_id)"
+  [ -n "$run_id" ] || die "report: no runs found — collect first"
+  do_report "$run_id"
+  audit "report" "$run_id" "ok"
+}
+
+cmd_ship() {
+  resolve_engagement
+  local run_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id)   run_id="${2:-}"; shift 2 ;;
+      --run-id=*) run_id="${1#*=}"; shift ;;
+      *) die "ship: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$run_id" ] || run_id="$(latest_run_id)"
+  [ -n "$run_id" ] || die "ship: no runs found — collect first"
+  require_cmds python3
+  [ -f "$SCRIPTS_DIR/siem_ship.py" ] || die "siem_ship.py not present in $SCRIPTS_DIR"
+
+  # Only ship to destinations that are actually configured in scope.yml. The token itself
+  # is never on the command line — siem_ship reads it from env/vault (CONTRACTS.md §6).
+  local splunk elastic flags=()
+  splunk="$(scope_get settings.splunk_hec_url "")"
+  elastic="$(scope_get settings.elastic_url "")"
+  [ -n "$splunk" ]  && flags+=(--splunk)
+  [ -n "$elastic" ] && flags+=(--elastic)
+  if [ "${#flags[@]}" -eq 0 ]; then
+    warn "shipping disabled — set settings.splunk_hec_url and/or settings.elastic_url in scope.yml"
+    audit "ship" "$run_id" "noop-disabled"
+    return 0
+  fi
+
+  python3 "$SCRIPTS_DIR/siem_ship.py" ship \
+    --engagement-dir "$ENGAGEMENT_DIR" --run-id "$run_id" "${flags[@]}"
+  audit "ship" "$run_id" "ok dest=${flags[*]}"
+}
+
+cmd_baseline() {
+  local sub="${1:-}"
+  [ "$sub" = "promote" ] || die "usage: $PROG baseline promote <host> <run_id> [--ticket T]"
+  shift
+  local host="${1:-}" run_id="${2:-}"
+  [ -n "$host" ] && [ -n "$run_id" ] || die "usage: $PROG baseline promote <host> <run_id> [--ticket T]"
+  shift 2
+  local ticket=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --ticket)   ticket="${2:-}"; shift 2 ;;
+      --ticket=*) ticket="${1#*=}"; shift ;;
+      *) die "baseline: unknown argument '$1'" ;;
+    esac
+  done
+  resolve_engagement
+  require_cmds python3
+  [ -f "$SCRIPTS_DIR/baseline.py" ] || die "baseline.py not present in $SCRIPTS_DIR"
+  local t=()
+  [ -n "$ticket" ] && t=(--ticket "$ticket")
+  python3 "$SCRIPTS_DIR/baseline.py" promote \
+    --engagement-dir "$ENGAGEMENT_DIR" --host "$host" --run-id "$run_id" "${t[@]}"
+  audit "baseline" "$run_id" "promote host=$host ticket=${ticket:-none}"
+}
+
+cmd_respond() {
+  # Thin passthrough to the response layer — a SEPARATE privilege domain (§7, §14). This
+  # console forwards the verb and args verbatim; it never loads response credentials itself.
+  resolve_engagement
+  local sub="${1:-}"
+  case "$sub" in
+    propose|approve|rollback) ;;
+    *) die "usage: $PROG respond <propose|approve|rollback> [args...]" ;;
+  esac
+  [ -f "$RESPOND_PY" ] || die "response layer not installed (missing $RESPOND_PY)"
+  require_cmds python3
+  export DRIFTWATCH_ENGAGEMENT DRIFTWATCH_ENGAGEMENT_DIR
+  info "respond '$sub' -> response layer (evidence-first, human-gated; §13)"
+  local rc=0
+  python3 "$RESPOND_PY" "$@" || rc=$?
+  audit "respond" "-" "$sub rc=$rc"
+  return "$rc"
+}
+
+cmd_status() {
+  resolve_engagement
+  require_cmds python3
+  local run_id; run_id="$(latest_run_id || true)"
+
+  python3 - "$ENGAGEMENT_DIR" "$ENGAGEMENT" "${run_id:-}" <<'PY'
+import json, os, sys
+eng_dir, engagement, run_id = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def load_yaml(path):
+    try:
+        import yaml
+        return yaml.safe_load(open(path, encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+scope = load_yaml(os.path.join(eng_dir, "scope.yml"))
+print(f"engagement : {engagement}")
+print(f"client     : {scope.get('client', '(unset)')}")
+print(f"authorized : {scope.get('authorized_by', '(unset)')}")
+
+fg_path = os.path.join(eng_dir, "inventory", "fleet_groups.json")
+if os.path.exists(fg_path):
+    try:
+        fg = json.load(open(fg_path, encoding="utf-8"))
+        groups = {}
+        for h, gs in fg.items():
+            for g in gs:
+                groups[g] = groups.get(g, 0) + 1
+        print(f"inventory  : {len(fg)} host(s) across {len(groups)} group(s) "
+              f"[{', '.join(f'{g}:{n}' for g, n in sorted(groups.items()))}]")
+    except Exception:
+        print("inventory  : (unreadable)")
+else:
+    print("inventory  : (not generated — run scope_gate generate)")
+
+tm_path = os.path.join(eng_dir, "preflight", "transport_matrix.json")
+if os.path.exists(tm_path):
+    try:
+        tm = json.load(open(tm_path, encoding="utf-8")).get("hosts", {})
+        counts = {}
+        for meta in tm.values():
+            t = meta.get("transport", "?")
+            counts[t] = counts.get(t, 0) + 1
+        print(f"transports : {', '.join(f'{t}:{n}' for t, n in sorted(counts.items())) or '(none)'}")
+    except Exception:
+        print("transports : (unreadable)")
+else:
+    print("transports : (no preflight yet)")
+
+print(f"latest run : {run_id or '(none)'}")
+if run_id:
+    rs_path = os.path.join(eng_dir, "snapshots", "_run", run_id + ".json")
+    if os.path.exists(rs_path):
+        rs = json.load(open(rs_path, encoding="utf-8"))
+        hs = rs.get("hosts", {})
+        by = {}
+        for v in hs.values():
+            by[v.get("status")] = by.get(v.get("status"), 0) + 1
+        print(f"collection : {', '.join(f'{s}:{n}' for s, n in sorted(by.items())) or '(none)'}"
+              f"  no_transport:{len(rs.get('no_transport', []))}  t3_only:{len(rs.get('t3_only', []))}")
+
+    nd = os.path.join(eng_dir, "findings", run_id + ".ndjson")
+    if os.path.exists(nd):
+        sev = {}
+        suppressed = 0
+        total = 0
+        for line in open(nd, encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            total += 1
+            f = json.loads(line)
+            if f.get("suppressed"):
+                suppressed += 1
+                continue
+            sev[f.get("severity")] = sev.get(f.get("severity"), 0) + 1
+        order = ["critical", "high", "medium", "low", "info"]
+        pretty = ", ".join(f"{s}:{sev[s]}" for s in order if s in sev) or "(none active)"
+        print(f"findings   : {pretty}   (total {total}, suppressed {suppressed})")
+    else:
+        print("findings   : (not diffed yet — run 'driftwatch diff')")
+PY
+
+  info "recent audit.log:"
+  tail -n 6 "$ENGAGEMENT_DIR/audit.log" 2>/dev/null || true
+}
+
+# Secure-delete a path. On modern SSD/CoW/network filesystems shred cannot guarantee the
+# blocks are gone — the LOAD-BEARING control is that the engagement volume is encrypted at
+# rest (design §15.1); shred is defense-in-depth on top of that. Intent documented on purpose.
+secure_delete() {
+  local target="$1"
+  [ -e "$target" ] || return 0
+  if command -v shred >/dev/null 2>&1; then
+    find "$target" -type f -exec shred -u -z -n 3 {} + 2>/dev/null || true
+  elif command -v srm >/dev/null 2>&1; then
+    find "$target" -type f -exec srm -f {} + 2>/dev/null || true
+  else
+    warn "no shred/srm on the kit — falling back to rm; rely on the encrypted volume for erasure"
+  fi
+  rm -rf "$target"
+}
+
+teardown_class_dir() {
+  case "$1" in
+    report)     echo "reports" ;;
+    findings)   echo "findings" ;;
+    cases)      echo "cases" ;;
+    snapshots)  echo "snapshots" ;;
+    configs)    echo "configs" ;;
+    baselines)  echo "baselines" ;;
+    evidence)   echo "evidence" ;;
+    inventory)  echo "inventory" ;;
+    preflight)  echo "preflight" ;;
+    *)          echo "" ;;
+  esac
+}
+
+cmd_teardown() {
+  local retain="report" assume_yes=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --retain)     retain="${2:-}"; shift 2 ;;
+      --retain=*)   retain="${1#*=}"; shift ;;
+      --yes|--force) assume_yes=true; shift ;;
+      *) die "teardown: unknown option '$1'" ;;
+    esac
+  done
+  resolve_engagement
+
+  # Default profile: shred everything except the report (fail-safe toward LESS retained
+  # client data, design §15.4). The vault is ALWAYS shredded — no retention profile can
+  # keep it. audit.log and scope.yml are always KEPT: they are the operator's legal record
+  # that the engagement stayed within authorization (§15.2).
+  local classes="report findings cases snapshots configs baselines evidence inventory preflight"
+  local retain_norm=",${retain//[[:space:]]/},"
+  local siem_retained=false
+  case "$retain_norm" in *,siem,*) siem_retained=true ;; esac
+
+  local keep=() drop=()
+  local cls
+  for cls in $classes; do
+    case "$retain_norm" in
+      *,"$cls",*) keep+=("$cls") ;;
+      *)          drop+=("$cls") ;;
+    esac
+  done
+
+  warn "TEARDOWN engagement '$ENGAGEMENT'"
+  warn "  KEEP  : ${keep[*]:-(none)}  + audit.log + scope.yml"
+  warn "  SHRED : ${drop[*]:-(none)}  + vault (always) + git history + caches"
+  if [ "$siem_retained" != true ]; then
+    warn "  SIEM  : Splunk/Security Onion indices are NOT wiped by this tool — wipe them"
+    warn "          deliberately (design §15.4); pass --retain ...,siem to acknowledge keeping them."
+  fi
+  warn "  Export anything you are retaining to your designated store BEFORE this runs."
+
+  if [ "$assume_yes" != true ]; then
+    printf '[%s] type the engagement id (%s) to confirm teardown: ' "$PROG" "$ENGAGEMENT" >&2
+    local answer=""
+    read -r answer || true
+    [ "$answer" = "$ENGAGEMENT" ] || die "confirmation did not match — teardown aborted (nothing shredded)"
+  fi
+
+  # vault ALWAYS — no override.
+  secure_delete "$ENGAGEMENT_DIR/vault"
+  # Tamper-evidence git repo + runtime caches (may hold copies of shredded classes).
+  secure_delete "$ENGAGEMENT_DIR/.git"
+  secure_delete "$ENGAGEMENT_DIR/.factcache"
+  secure_delete "$ENGAGEMENT_DIR/.retry"
+  rm -f "$ENGAGEMENT_DIR/.collect.lock" 2>/dev/null || true
+
+  for cls in "${drop[@]}"; do
+    local d; d="$(teardown_class_dir "$cls")"
+    [ -n "$d" ] && secure_delete "$ENGAGEMENT_DIR/$d"
+  done
+  # Ansible run logs are engagement data too (they record what ran on each host).
+  case "$retain_norm" in *,snapshots,*) : ;; *) secure_delete "$ENGAGEMENT_DIR/audit/hostlogs"; secure_delete "$ENGAGEMENT_DIR/audit/ansible-run.log" ;; esac
+
+  audit "teardown" "-" "shredded=[${drop[*]:-}] kept=[${keep[*]:-}] vault=shredded siem_kept=$siem_retained"
+  info "teardown complete — kept: ${keep[*]:-(report only)} (+ audit.log, scope.yml). Rebuild the kit from image before the next engagement."
+}
+
+# --------------------------------------------------------------------------- usage / dispatch
+usage() {
+  cat >&2 <<EOF
+$PROG — blue-team baseline & drift-detection operator console
+
+usage: $PROG [--engagement <id>] <verb> [options]
+  (engagement resolves from --engagement or \$DRIFTWATCH_ENGAGEMENT; required for all
+   verbs except new-engagement, which takes the id as an argument)
+
+verbs:
+  new-engagement <id>                 create an engagement volume from the template
+  preflight                           Kerberos prereqs + Windows transport matrix
+  collect [--deep] [--limit PATTERN] [--collect-only]
+                                      scope-gate -> snapshot -> (diff -> report)
+  diff [--run-id R]                   normalize + diff engine on the control node
+  report [--run-id R]                 render Markdown + HTML report
+  ship [--run-id R]                   ship findings to the kit SIEM (per scope.yml settings)
+  baseline promote <host> <run_id> [--ticket T]
+  respond <propose|approve|rollback> ...   passthrough to the response layer
+  status                              read-only engagement dashboard
+  teardown [--retain a,b,...] [--yes] shred the volume (report kept by default; vault ALWAYS)
+
+examples:
+  $PROG new-engagement acme-2026-07
+  DRIFTWATCH_ENGAGEMENT=acme-2026-07 $PROG preflight
+  $PROG --engagement acme-2026-07 collect --deep
+  $PROG --engagement acme-2026-07 teardown --retain report,findings
+EOF
+}
+
+main() {
+  # Pull the global --engagement out of the arg stream wherever it appears.
+  local rest=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --engagement)   ENGAGEMENT="${2:-}"; [ -n "$ENGAGEMENT" ] || die "--engagement needs a value"; shift 2 ;;
+      --engagement=*) ENGAGEMENT="${1#*=}"; shift ;;
+      *)              rest+=("$1"); shift ;;
+    esac
+  done
+  set -- ${rest[@]+"${rest[@]}"}
+
+  local verb="${1:-}"
+  [ $# -gt 0 ] && shift || true
+
+  case "$verb" in
+    new-engagement) cmd_new_engagement "$@" ;;
+    preflight)      cmd_preflight "$@" ;;
+    collect)        cmd_collect "$@" ;;
+    diff)           cmd_diff "$@" ;;
+    report)         cmd_report "$@" ;;
+    ship)           cmd_ship "$@" ;;
+    baseline)       cmd_baseline "$@" ;;
+    respond)        cmd_respond "$@" ;;
+    status)         cmd_status "$@" ;;
+    teardown)       cmd_teardown "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) err "unknown verb: $verb"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

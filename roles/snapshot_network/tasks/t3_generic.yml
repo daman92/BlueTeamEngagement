@@ -1,0 +1,40 @@
+---
+# roles/snapshot_network/tasks/t3_generic.yml
+#
+# Tier-3: unknown/unrecognized device that answers SSH. Try a small ladder of
+# universal config-retrieval commands and keep whatever returns usable output.
+# READ ONLY: cli_command only, tagged `readonly`; nothing written to the target.
+#
+# Config-text diff is the universal backstop (design §4.3): even with zero vendor
+# knowledge, "the running config changed and here are the lines" is the single
+# highest-value network finding. T3 therefore delivers device_config ONLY — it
+# is assembled from dw_net_config_raw by tasks/main.yml. The `t3_only` coverage
+# gap itself is emitted downstream by diff_engine from the run status the CLI
+# records (CONTRACTS.md §6), not by this role.
+
+- name: Try the generic config-retrieval ladder
+  ansible.netcommon.cli_command:
+    command: "{{ item }}"
+  register: r_t3
+  ignore_errors: true
+  loop: "{{ dw_net_t3_ladder }}"
+  loop_control:
+    label: "{{ item }}"
+  when: (dw_net_config_raw | length) == 0
+  tags: [readonly]
+
+- name: Keep the first ladder command that returned usable output
+  ansible.builtin.set_fact:
+    dw_net_config_raw: "{{ item.stdout }}"
+    dw_net_detected_os: >-
+      {{ dw_net_detected_os if (dw_net_detected_os | length > 0)
+         else ('generic (' ~ (item.item) ~ ')') }}
+  loop: "{{ r_t3.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - (dw_net_config_raw | length) == 0
+    - not (item.failed | default(false))
+    - not (item.skipped | default(false))
+    - (item.stdout | default('')) | length > 0
+    - not ((item.stdout | default('')) is search('(?i)invalid input|unknown command|% bad|% incomplete'))

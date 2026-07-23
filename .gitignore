@@ -1,0 +1,48 @@
+# --- Secrets & client data: NEVER commit -------------------------------------
+# Engagement volumes hold client snapshots, credentials, findings, evidence.
+# The template is tracked; real engagements are not.
+engagements/*
+!engagements/_template/
+!engagements/_template/**
+**/vault/
+**/vault.yml
+*.vault
+vault_pass*
+*.pem
+*.key
+id_rsa*
+krb5.conf
+
+# --- Response layer live cases/evidence --------------------------------------
+response/cases/*
+!response/cases/.gitkeep
+response/evidence/
+
+# --- Python ------------------------------------------------------------------
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# --- Ansible runtime ---------------------------------------------------------
+*.retry
+collections/
+ansible_collections/
+.ansible/
+
+# --- Local run artifacts -----------------------------------------------------
+reports/*.html
+reports/*.md
+!reports/.gitkeep
+snapshots/
+*.log
+!docs/**
+
+# --- OS / editor -------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

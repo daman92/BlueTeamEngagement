@@ -1,0 +1,34 @@
+[Unit]
+Description=driftwatch fast collection (processes, ports, connections, tasks/cron, users, services, autoruns)
+Documentation=file:///opt/driftwatch/systemd/README.md
+# Do not start unless an engagement is selected — no guessing which client we point at.
+ConditionPathExists=/etc/driftwatch/engagement.env
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=driftwatch
+Group=driftwatch
+WorkingDirectory=/opt/driftwatch
+# Supplies DRIFTWATCH_ENGAGEMENT, DRIFTWATCH_OPERATOR, ANSIBLE_CONFIG, KRB5CCNAME (see README).
+EnvironmentFile=/etc/driftwatch/engagement.env
+# The fast set is the default (no --deep). collect also runs diff + report, so a scheduled
+# run produces an updated report with no second unit.
+ExecStart=/opt/driftwatch/bin/driftwatch collect
+# Be a polite guest on the target fleet.
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+
+# --- hardening (the collector holds fleet credentials; treat it as tier-0, §9) ----------
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# The engagement volume + repo must be writable; adjust if your volume is mounted elsewhere.
+ReadWritePaths=/opt/driftwatch/engagements
+
+[Install]
+WantedBy=multi-user.target

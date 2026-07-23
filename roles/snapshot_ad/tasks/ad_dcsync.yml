@@ -1,0 +1,76 @@
+---
+# tasks/ad_dcsync.yml — CONTRACTS.md §3.3 ad_dcsync
+# identity: sid | other: sam, rights (sorted)
+#
+# Principals holding replication rights on the domain naming context — i.e. anyone
+# who can run a DCSync (W18). Reads the domain object's ACL and matches the two (three)
+# DS-Replication-Get-Changes* extended-right GUIDs. Default holders (Domain Admins,
+# Enterprise Admins, Administrators, Domain Controllers) are reported as-is; policy /
+# normalization on the control node decides which are expected.
+
+- name: Collect DCSync-capable principals (ad_dcsync) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      DomainDN: "{{ ad_domain_dn }}"
+    script: |
+      param(
+        [string]$DomainDN
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $replGuids = @{
+        '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes'
+        '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' = 'DS-Replication-Get-Changes-All'
+        '89e95b76-444d-4c62-991a-0facbeda640c' = 'DS-Replication-Get-Changes-In-Filtered-Set'
+      }
+
+      $acl = Get-Acl -Path ("AD:\" + $DomainDN) -ErrorAction Stop
+      $byPrincipal = @{}
+      foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        if ("$($ace.ActiveDirectoryRights)" -notmatch 'ExtendedRight') { continue }
+        $ot = ([string]$ace.ObjectType).ToLower()
+        if (-not $replGuids.ContainsKey($ot)) { continue }
+
+        $sid = $null
+        try {
+          if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+            $sid = [string]$ace.IdentityReference.Value
+          } else {
+            $sid = (New-Object System.Security.Principal.NTAccount([string]$ace.IdentityReference.Value)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+          }
+        } catch {
+          $sid = [string]$ace.IdentityReference.Value
+        }
+        if (-not $byPrincipal.ContainsKey($sid)) { $byPrincipal[$sid] = New-Object System.Collections.Generic.HashSet[string] }
+        [void]$byPrincipal[$sid].Add($replGuids[$ot])
+      }
+
+      $result = New-Object System.Collections.Generic.List[object]
+      foreach ($sid in $byPrincipal.Keys) {
+        # Get-ADObject -Identity accepts only DN/GUID, never a SID string — resolve the
+        # SID via an LDAP filter instead (works for domain and BUILTIN principals alike).
+        $sam = $null
+        try {
+          $obj = Get-ADObject -LDAPFilter "(objectSid=$sid)" -Properties samAccountName -ErrorAction Stop |
+                   Select-Object -First 1
+          if ($obj -and $obj.samAccountName) { $sam = [string]$obj.samAccountName }
+        } catch { }
+        $result.Add(@{
+          sid    = [string]$sid
+          sam    = $sam
+          rights = @($byPrincipal[$sid] | Sort-Object)
+        })
+      }
+      $Ansible.Result = @($result)
+  register: ad_dcsync_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_dcsync result / status
+  ansible.builtin.set_fact:
+    ad_dcsync_items: "{{ ad_dcsync_reg.result | default([]) if ad_dcsync_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_dcsync'] if ad_dcsync_reg is failed else []) }}"

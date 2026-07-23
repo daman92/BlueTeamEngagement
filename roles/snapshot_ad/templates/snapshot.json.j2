@@ -1,0 +1,11 @@
+{#-
+  roles/snapshot_ad/templates/snapshot.json.j2
+
+  Renders the assembled AD snapshot document (built as the `dw_ad_snapshot` fact in
+  tasks/assemble.yml) as canonical-ish JSON on the CONTROL NODE. The role emits a RAW
+  snapshot — sorting / volatile-strip / normalization happen later in
+  scripts/normalize.py; this template only serializes the composed dict faithfully.
+
+  Top-level keys are exactly: meta + the 8 CONTRACTS.md §3.3 `ad` categories.
+-#}
+{{ dw_ad_snapshot | to_nice_json }}

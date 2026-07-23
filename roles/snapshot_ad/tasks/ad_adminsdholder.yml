@@ -1,0 +1,41 @@
+---
+# tasks/ad_adminsdholder.yml — CONTRACTS.md §3.3 ad_adminsdholder (OBJECT category)
+# other: acl_hash, protected_count
+#
+# The AdminSDHolder ACL is stamped onto every protected (adminCount=1) object by SDProp;
+# an attacker who adds an ACE here gains standing rights over all tier-0 accounts (W18).
+# acl_hash = sha256 of the object's SDDL; protected_count = current adminCount=1 objects.
+
+- name: Collect AdminSDHolder ACL + protected count (ad_adminsdholder) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      DomainDN: "{{ ad_domain_dn }}"
+    script: |
+      param(
+        [string]$DomainDN
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $asdhDN = "CN=AdminSDHolder,CN=System,$DomainDN"
+      $acl = Get-Acl -Path ("AD:\" + $asdhDN) -ErrorAction Stop
+      $sddl = [string]$acl.Sddl
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($sddl)
+      $sha = [System.Security.Cryptography.SHA256]::Create()
+      $hash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLower()
+
+      $protected = @(Get-ADObject -SearchBase $DomainDN -LDAPFilter '(adminCount=1)' -ResultPageSize 1000 -ErrorAction SilentlyContinue)
+      $Ansible.Result = @{
+        acl_hash        = $hash
+        protected_count = [int]$protected.Count
+      }
+  register: ad_adminsdholder_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_adminsdholder result / status
+  ansible.builtin.set_fact:
+    ad_adminsdholder_obj: "{{ ad_adminsdholder_reg.result | default({}) if ad_adminsdholder_reg is not failed else {} }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_adminsdholder'] if ad_adminsdholder_reg is failed else []) }}"

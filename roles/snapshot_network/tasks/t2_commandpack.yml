@@ -1,0 +1,134 @@
+---
+# roles/snapshot_network/tasks/t2_commandpack.yml
+#
+# Tier-2: drive a data-only YAML command pack (command_packs/*.yml) with
+# ansible.netcommon.cli_command. NO vendor code lives here — adding a vendor is
+# adding a pack file (see command_packs/README.md). READ ONLY: cli_command only,
+# tagged `readonly`; nothing is written to the target.
+#
+# Guaranteed output: device_config (config text via the pack's ladder, then
+# sanitized+hashed by tasks/main.yml). Optional output: whatever structured
+# §3.4 categories the pack declares under `categories:`.
+
+- name: Assert a command pack was selected
+  ansible.builtin.assert:
+    that:
+      - dw_net_pack is defined
+    fail_msg: "t2_commandpack invoked without a selected command pack"
+    quiet: true
+
+- name: Derive detected OS from pack metadata
+  ansible.builtin.set_fact:
+    dw_net_detected_os: "{{ dw_net_pack.meta.os | default(dw_net_pack.meta.vendor | default('unknown')) }}"
+
+# --------------------------------------------------------------------------- #
+# Config text (the universal backstop) via the pack's config-command ladder
+# --------------------------------------------------------------------------- #
+- name: Collect device config via the pack ladder
+  ansible.netcommon.cli_command:
+    command: "{{ item }}"
+  register: r_pack_config
+  ignore_errors: true
+  loop: "{{ dw_net_pack.config.commands | default([]) }}"
+  loop_control:
+    label: "{{ item }}"
+  tags: [readonly]
+
+- name: Keep the first non-empty config output
+  ansible.builtin.set_fact:
+    dw_net_config_raw: "{{ item.stdout }}"
+  loop: "{{ r_pack_config.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('') }}"
+  when:
+    - (dw_net_config_raw | length) == 0
+    - not (item.failed | default(false))
+    - not (item.skipped | default(false))
+    - (item.stdout | default('')) | length > 0
+
+# --------------------------------------------------------------------------- #
+# Structured categories the pack declares (fully declarative parsing)
+# --------------------------------------------------------------------------- #
+- name: Run pack category commands
+  ansible.netcommon.cli_command:
+    command: "{{ item.value.command }}"
+  register: r_pack_cats
+  ignore_errors: true
+  loop: "{{ (dw_net_pack.categories | default({})) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: item.value.command is defined
+  tags: [readonly]
+
+- name: Index pack category command outputs by category name
+  ansible.builtin.set_fact:
+    dw_pack_outputs: >-
+      {{ (dw_pack_outputs | default({})) | combine({ item.item.key: (item.stdout | default('')) }) }}
+  loop: "{{ r_pack_cats.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('') }}"
+  when: not (item.skipped | default(false))
+
+- name: Flatten pack matches into (category, item) rows and per-object dicts
+  ansible.builtin.set_fact:
+    # Emits a JSON string (then parsed back to real data) describing:
+    #   arrays:  list of {cat, item}  — one per regex match, fields zipped by name
+    #   objects: list of {cat, item}  — one dict per object category
+    # Building JSON text and piping through from_json keeps the result a real
+    # typed structure (avoids Jinja statement-block stringification).
+    dw_pack_parsed: >-
+      {{ _pack_parsed_json | from_json }}
+  vars:
+    _pack_parsed_json: |-
+      {%- set arrays = [] -%}
+      {%- set objects = [] -%}
+      {%- for cat, spec in (dw_net_pack.categories | default({})).items() -%}
+        {%- set text = (dw_pack_outputs | default({})).get(cat, '') -%}
+        {%- if (spec.kind | default('array')) == 'array' -%}
+          {%- for row in text | regex_findall(spec.line_regex) -%}
+            {%- set obj = {} -%}
+            {%- set rowlist = ([row] if (row is string) else row) -%}
+            {%- for f in spec.fields -%}
+              {%- set _ = obj.update({ f: (rowlist[loop.index0] if (loop.index0 < (rowlist | length)) else '') }) -%}
+            {%- endfor -%}
+            {%- set _ = obj.update(spec.static | default({})) -%}
+            {%- set _ = arrays.append({'cat': cat, 'item': obj}) -%}
+          {%- endfor -%}
+        {%- else -%}
+          {%- set obj = {} -%}
+          {#- spec['keys'], NOT spec.keys: dot-lookup would hit dict.keys() -#}
+          {%- for k, kregex in (spec['keys'] | default({})).items() -%}
+            {%- set m = text | regex_search(kregex) -%}
+            {%- set _ = obj.update({ k: (m if (m is not none) else '') }) -%}
+          {%- endfor -%}
+          {%- set _ = obj.update(spec.static | default({})) -%}
+          {%- set _ = objects.append({'cat': cat, 'item': obj}) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ {'arrays': arrays, 'objects': objects} | to_json }}
+
+- name: Assemble pack object categories
+  ansible.builtin.set_fact:
+    dw_net_categories: "{{ dw_net_categories | combine({ item.cat: item.item }) }}"
+  loop: "{{ (dw_pack_parsed.objects | default([])) }}"
+  loop_control:
+    label: "{{ item.cat }}"
+
+- name: Assemble pack array categories
+  ansible.builtin.set_fact:
+    dw_net_categories: >-
+      {{ dw_net_categories | combine({ item.cat: ((dw_net_categories[item.cat] | default([])) + [ item.item ]) }) }}
+  loop: "{{ (dw_pack_parsed.arrays | default([])) }}"
+  loop_control:
+    label: "{{ item.cat }}"
+
+# --------------------------------------------------------------------------- #
+# Failure accounting: any declared category whose command errored -> failed
+# --------------------------------------------------------------------------- #
+- name: Account failed pack categories
+  ansible.builtin.set_fact:
+    dw_failed_categories: >-
+      {{ (dw_failed_categories
+          + (r_pack_cats.results | default([])
+             | selectattr('failed', 'defined') | selectattr('failed')
+             | map(attribute='item') | map(attribute='key') | list)) | unique | sort }}

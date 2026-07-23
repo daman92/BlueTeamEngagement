@@ -1,0 +1,67 @@
+---
+# W10 drivers (CONTRACTS §3.2 `drivers`)
+# identity: name, path | other: signed, signer, version, sha256
+#
+# Signature (cheap) is always collected; sha256 (a full file read) is gated on deep runs
+# — drivers are BYOVD surface, so an unsigned/new driver is the priority signal and does
+# not need the hash to be flagged. Signing/hashing is cached per path.
+
+- name: "W10 drivers"
+  ansible.windows.win_powershell:
+    depth: 5
+    parameters:
+      Deep: "{{ dw_deep | bool | ternary('true', 'false') }}"
+    script: |
+      param([string]$Deep = 'false')
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $deep = $Deep -eq 'true'
+      $sigCache = @{}
+      $hashCache = @{}
+
+      $out = foreach ($d in (Get-CimInstance -ClassName Win32_SystemDriver -ErrorAction Stop)) {
+        $path = $d.PathName
+        if ($path) { $path = ([Environment]::ExpandEnvironmentVariables($path)) -replace '^\\\?\?\\', '' }
+
+        $signed = $false; $signer = $null; $ver = $null; $sha = $null
+        if ($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) {
+          if ($sigCache.ContainsKey($path)) { $sg = $sigCache[$path] }
+          else {
+            $sg = [ordered]@{ signed = $false; signer = $null }
+            try {
+              $s = Get-AuthenticodeSignature -LiteralPath $path -ErrorAction Stop
+              $sg.signed = ($s.Status -eq 'Valid')
+              if ($s.SignerCertificate) { $sg.signer = $s.SignerCertificate.Subject }
+            } catch {}
+            $sigCache[$path] = $sg
+          }
+          $signed = $sg.signed; $signer = $sg.signer
+          try { $ver = (Get-Item -LiteralPath $path -ErrorAction Stop).VersionInfo.FileVersion } catch {}
+          if ($deep) {
+            if ($hashCache.ContainsKey($path)) { $sha = $hashCache[$path] }
+            else {
+              try { $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+              $hashCache[$path] = $sha
+            }
+          }
+        }
+
+        [ordered]@{
+          name    = $d.Name
+          path    = $path
+          signed  = [bool]$signed
+          signer  = $signer
+          version = $ver
+          sha256  = $sha
+        }
+      }
+      $out
+  register: reg_drivers
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record drivers collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['drivers'] }}"
+  when: reg_drivers is failed

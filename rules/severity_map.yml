@@ -1,0 +1,98 @@
+# driftwatch — severity map for drift findings (CONTRACTS.md §5.2)
+# =============================================================================
+# Applies ONLY to pure-drift findings (change_type added/removed/changed/
+# coverage_gap that no policy rule matched). Policy findings carry their own
+# severity from rules/policy_checks.yml and always win when a policy delta and a
+# drift delta merge on the same fingerprint (scripts/diff_engine.py:assemble).
+#
+# Resolution (diff_engine.base_severity):
+#   1. Walk `overrides` top-down; the FIRST override whose platform, category and
+#      change_type all match (each defaulting to "any") wins.
+#   2. Otherwise fall back to defaults[change_type].
+# So overrides are ordered MOST-SPECIFIC FIRST: platform-specific rows precede
+# their platform:any generalisations.
+#
+# Seeded from design Appendix A (Severity Mapping). Appendix A "Critical" items
+# are handled by policy rules; this file realises the "High" and "Medium" tiers
+# as drift severities and provides the safety-net for everything else.
+# =============================================================================
+
+defaults:
+  added: medium        # a new item, unknown criticality
+  removed: low         # things disappearing is usually benign (decommissions)
+  changed: medium      # an attribute changed
+  outlier: medium      # fleet-outlier deltas arrive as change_type=added; here for documentation
+  coverage_gap: high   # a broken/absent collection is a finding (design §5 rule 5)
+  policy: high         # documentation only — policy deltas carry per-rule severity
+
+overrides:
+
+  # --- linux -----------------------------------------------------------------
+  # Appendix A High: cron/systemd timer, sudoers/authorized_keys change, new
+  # host-firewall allow, new listening port on a server, new SMB share,
+  # DNS/proxy changed, logging/forwarding broken.
+  - {platform: linux, category: cron,            change_type: added,   severity: high}
+  - {platform: linux, category: systemd_units,   change_type: added,   severity: high}
+  - {platform: linux, category: systemd_units,   change_type: changed, severity: high}
+  - {platform: linux, category: persistence,     change_type: added,   severity: high}
+  - {platform: linux, category: persistence,     change_type: changed, severity: high}
+  - {platform: linux, category: sudoers,         change_type: added,   severity: high}
+  - {platform: linux, category: sudoers,         change_type: changed, severity: high}
+  - {platform: linux, category: ssh_keys,        change_type: added,   severity: high}
+  - {platform: linux, category: ssh_config,      change_type: changed, severity: high}
+  - {platform: linux, category: firewall,        change_type: added,   severity: high}
+  - {platform: linux, category: listening,       change_type: added,   severity: high}
+  - {platform: linux, category: listening,       change_type: changed, severity: high}
+  - {platform: linux, category: shares,          change_type: added,   severity: high}
+  - {platform: linux, category: kernel_modules,  change_type: added,   severity: high}
+  - {platform: linux, category: logging_health,  change_type: changed, severity: high}
+  - {platform: linux, category: users,           change_type: added,   severity: high}
+
+  # --- windows ---------------------------------------------------------------
+  - {platform: windows, category: services,         change_type: added,   severity: high}
+  - {platform: windows, category: scheduled_tasks,  change_type: added,   severity: high}
+  - {platform: windows, category: scheduled_tasks,  change_type: changed, severity: high}
+  - {platform: windows, category: autoruns,         change_type: added,   severity: high}
+  - {platform: windows, category: wmi_subscriptions,change_type: added,   severity: high}
+  - {platform: windows, category: drivers,          change_type: added,   severity: high}
+  - {platform: windows, category: local_groups,     change_type: added,   severity: high}
+  - {platform: windows, category: firewall,         change_type: added,   severity: high}
+  - {platform: windows, category: listening,        change_type: added,   severity: high}
+  - {platform: windows, category: shares,           change_type: added,   severity: high}
+  - {platform: windows, category: powershell_surface,change_type: changed, severity: high}
+  - {platform: windows, category: security_posture, change_type: changed, severity: high}
+  - {platform: windows, category: audit_logging,    change_type: changed, severity: high}
+  - {platform: windows, category: users,            change_type: added,   severity: high}
+
+  # --- network ---------------------------------------------------------------
+  # Appendix A High: unsaved config, new static route, unknown neighbor,
+  # syslog target removed, STP root change / new trunk, change with no ticket.
+  - {platform: network, category: config_saved,       change_type: changed, severity: high}
+  - {platform: network, category: change_provenance,  change_type: changed, severity: high}
+  - {platform: network, category: static_routes,      change_type: added,   severity: high}
+  - {platform: network, category: routing_neighbors,  change_type: added,   severity: high}
+  - {platform: network, category: neighbors,          change_type: added,   severity: high}
+  - {platform: network, category: firewall_rules,     change_type: added,   severity: high}
+  - {platform: network, category: mgmt_services,      change_type: changed, severity: high}
+  - {platform: network, category: logging_time,       change_type: changed, severity: high}
+  - {platform: network, category: l2_state,           change_type: changed, severity: high}
+  - {platform: network, category: protection_features,change_type: changed, severity: high}
+  - {platform: network, category: aaa,                change_type: changed, severity: high}
+  - {platform: network, category: local_accounts,     change_type: added,   severity: high}
+  - {platform: network, category: device_config,      change_type: changed, severity: high}
+
+  # --- ad --------------------------------------------------------------------
+  - {platform: ad, category: ad_admins,            change_type: added,   severity: high}
+  - {platform: ad, category: ad_privileged_groups, change_type: added,   severity: high}
+  - {platform: ad, category: ad_gpos,              change_type: changed, severity: high}
+  - {platform: ad, category: ad_dcsync,            change_type: added,   severity: high}
+  - {platform: ad, category: ad_delegation,        change_type: added,   severity: high}
+  - {platform: ad, category: ad_krbtgt,            change_type: changed, severity: high}
+
+  # --- cross-platform (evaluated after the platform-specific rows above) ------
+  # Appendix A: DNS/proxy changed = High (design L15/W13); dns_trust additions
+  # that are not CAs/hosts overrides (resolver/proxy) are High too.
+  - {platform: any, category: dns_trust, change_type: changed, severity: high}
+  - {platform: any, category: dns_trust, change_type: added,   severity: high}
+  # A broken or partial collection is always at least High (design §5 rule 5).
+  - {platform: any, category: any, change_type: coverage_gap, severity: high}

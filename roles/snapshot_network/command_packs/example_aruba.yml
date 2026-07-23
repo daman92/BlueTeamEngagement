@@ -1,0 +1,69 @@
+---
+# command_packs/example_aruba.yml
+#
+# Sample Tier-2 command pack (ArubaOS-CX-style CLI). A pack is DATA, not code:
+# it teaches the generic t2_commandpack.yml handler which `show` commands to run
+# and how to turn their output into CONTRACTS.md §3.4 categories. Copy this file,
+# rename it, adjust the regexes, and a new vendor is supported with no role edit.
+# See command_packs/README.md for the full schema.
+
+meta:
+  vendor: "Aruba"
+  os: "arubaoscx"            # -> snapshot meta.os; also matched vs ansible_network_os
+  fingerprint:              # OR-joined, case-insensitive, searched in `show version`
+    - "ArubaOS-CX"
+    - "Aruba.*Switch"
+
+# The config-text backstop: first command returning usable output becomes the
+# sanitized device_config (sha256 / line_count / config_path / tier).
+config:
+  commands:
+    - "show running-config"
+
+# Optional structured categories. Each is parsed declaratively:
+#   kind: array  -> `line_regex` run over `command` output with regex_findall;
+#                   capture groups are zipped, in order, onto `fields`; `static`
+#                   fields are merged into every produced item.
+#   kind: object -> each `keys:` entry is a regex whose MATCH TEXT becomes the
+#                   value (use lookbehind so only the value is captured); `static`
+#                   supplies the remaining keys.
+# Never capture secret material into a field — config sanitization already
+# redacts secrets in the stored .conf; leave secret_hash empty here.
+categories:
+
+  local_accounts:
+    kind: array
+    command: "show running-config"
+    line_regex: '(?im)^user (\S+) group (\S+)'
+    fields: [username, privilege]
+    static:
+      secret_hash: ""
+
+  mgmt_services:
+    kind: array
+    command: "show running-config"
+    line_regex: '(?im)^(ssh|https|http|telnet)[- ]server'
+    fields: [service]
+    static:
+      enabled: true
+      detail: "present in running-config"
+
+  snmp:
+    kind: array
+    command: "show running-config"
+    line_regex: '(?im)^snmp-server host (\S+)'
+    fields: [key]
+    static:
+      kind: "trap_target"
+      access: ""
+      targets: []
+
+  logging_time:
+    kind: object
+    command: "show running-config"
+    keys:
+      logging_level: '(?i)(?<=logging severity )\S+'
+    static:
+      syslog_targets: []
+      ntp_servers: []
+      ntp_synced: false

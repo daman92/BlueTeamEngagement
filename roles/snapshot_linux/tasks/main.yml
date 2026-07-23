@@ -1,0 +1,98 @@
+---
+# snapshot_linux — read-only Linux collector (design §4.1 L1-L17, CONTRACTS §3.1).
+#
+# Read-only by construction (enforced by scripts/lint_readonly.py, a security control
+# per design §15.3): every collection task is an ansible.builtin.shell read carrying
+# the `readonly` tag. Each category task registers raw US(0x1F)-delimited records as
+# a dw_raw_* fact; templates/snapshot.json.j2 parses them into the exact §3.1 field
+# sets. The ONLY writes are the snapshot assembly at the end of this file, delegated
+# to localhost (control node) — nothing is ever written to the target.
+#
+# A failed category never fails the play (CONTRACTS §1.5): every collection task has
+# ignore_errors + failed_when: false, and a non-zero rc records the category in
+# dw_failed_categories, which marks the final document meta.partial with
+# meta.failed_categories populated. The document stays structurally complete
+# (empty []/{} for a failed category) so the diff engine can still compare it.
+#
+# Deep/expensive work (binary hashing, packages, CA-cert enumeration) is gated on
+# dw_deep / dw_hash_policy via the dw_snapshot_linux_do_hash predicate (defaults).
+
+- name: Initialize snapshot assembly state
+  ansible.builtin.set_fact:
+    dw_failed_categories: []
+
+- name: Collect host meta (OS, collection time)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    osname="Linux"
+    if [ -r /etc/os-release ]; then
+      . /etc/os-release
+      osname="${PRETTY_NAME:-${NAME:-Linux} ${VERSION_ID:-}}"
+    fi
+    printf '%s\n' "$osname$US$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_hostmeta
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: Stash host meta
+  ansible.builtin.set_fact:
+    dw_raw_hostmeta: "{{ dw_hostmeta.stdout | default('') }}"
+
+# --- Category fragments (each stashes dw_raw_* records + failure marks) ---------------
+- name: "L1/L2 - Processes & fileless indicators"
+  ansible.builtin.include_tasks: processes.yml
+- name: "L3/L4/L14/L15/L16 - Network exposure & trust surface"
+  ansible.builtin.include_tasks: network.yml
+- name: "L5   - Cron & at jobs"
+  ansible.builtin.include_tasks: cron.yml
+- name: "L6   - systemd units, timers & drop-ins"
+  ansible.builtin.include_tasks: systemd_units.yml
+- name: "L7   - Other persistence"
+  ansible.builtin.include_tasks: persistence.yml
+- name: "L8a  - Users"
+  ansible.builtin.include_tasks: users.yml
+- name: "L8b  - Groups"
+  ansible.builtin.include_tasks: groups.yml
+- name: "L9a  - SSH authorized keys"
+  ansible.builtin.include_tasks: ssh_keys.yml
+- name: "L9b  - sshd effective config"
+  ansible.builtin.include_tasks: ssh_config.yml
+- name: "L10  - Sudoers"
+  ansible.builtin.include_tasks: sudoers.yml
+- name: "L11a - Kernel modules"
+  ansible.builtin.include_tasks: kernel_modules.yml
+- name: "L11b - Kernel taint & sysctls"
+  ansible.builtin.include_tasks: kernel_state.yml
+- name: "L12  - Packages (deep runs only)"
+  ansible.builtin.include_tasks: packages.yml
+- name: "L13  - File integrity (SUID inventory + critical set)"
+  ansible.builtin.include_tasks: file_integrity.yml
+- name: "L17  - Logging health"
+  ansible.builtin.include_tasks: logging_health.yml
+
+# --- Assemble on the control node and write the snapshot document ---------------------
+# READ-ONLY GUARANTEE: these are the only write modules in the role and both are
+# delegate_to: localhost — the snapshot document (CONTRACTS §2: meta + exactly the
+# 20 §3.1 linux category keys, rendered by templates/snapshot.json.j2) lands at
+# {{ dw_snapshot_dir }}/{{ inventory_hostname }}/{{ dw_run_id }}.json, never on the target.
+
+- name: Ensure the host snapshot directory exists on the control node
+  ansible.builtin.file:
+    path: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+
+- name: Write the snapshot document to the control node
+  ansible.builtin.copy:
+    dest: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}/{{ dw_run_id }}.json"
+    content: "{{ lookup('template', 'snapshot.json.j2') }}"
+    mode: "0600"
+  delegate_to: localhost

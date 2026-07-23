@@ -1,0 +1,55 @@
+---
+# tasks/assemble.yml
+#
+# Build the single AD snapshot document (top-level keys = meta + the 8 §3.3 `ad`
+# categories, exactly) and write it on the CONTROL NODE. The role writes NOTHING to
+# the target: the only write modules here are file/template, both delegate_to: localhost
+# (the sole use permitted by scripts/lint_readonly.py).
+#
+# Output path (CONTRACTS.md §2): snapshots/_domain_<fqdn>/<run_id>.json
+
+- name: Compose the AD snapshot document
+  ansible.builtin.set_fact:
+    dw_ad_snapshot:
+      meta:
+        schema_version: "1.0"
+        host: "{{ ad_domain_fqdn }}"
+        platform: "ad"
+        os: "{{ ad_domain_os }}"
+        collected_at: "{{ ad_collected_at }}"
+        collector_version: "driftwatch 0.1.0"
+        engagement: "{{ dw_engagement }}"
+        run_id: "{{ dw_run_id }}"
+        partial: "{{ ((dw_ad_failed_categories | length) > 0) | bool }}"
+        failed_categories: "{{ dw_ad_failed_categories | unique | sort }}"
+        hash_policy: "{{ dw_hash_policy }}"
+      ad_admins: "{{ ad_admins_items }}"
+      ad_privileged_groups: "{{ ad_privileged_groups_items }}"
+      ad_gpos: "{{ ad_gpos_items }}"
+      ad_dcsync: "{{ ad_dcsync_items }}"
+      ad_delegation: "{{ ad_delegation_items }}"
+      ad_kerberoastable: "{{ ad_kerberoastable_items }}"
+      ad_krbtgt: "{{ ad_krbtgt_obj }}"
+      ad_adminsdholder: "{{ ad_adminsdholder_obj }}"
+
+- name: Ensure the domain snapshot directory exists on the control node
+  ansible.builtin.file:
+    path: "{{ dw_snapshot_dir }}/_domain_{{ ad_domain_fqdn }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+
+- name: Write the AD snapshot document to the control node
+  ansible.builtin.template:
+    src: snapshot.json.j2
+    dest: "{{ dw_snapshot_dir }}/_domain_{{ ad_domain_fqdn }}/{{ dw_run_id }}.json"
+    mode: "0600"
+  delegate_to: localhost
+
+- name: Report where the AD snapshot was written
+  ansible.builtin.debug:
+    msg: >-
+      AD snapshot for domain {{ ad_domain_fqdn }} (run {{ dw_run_id }}) written to
+      {{ dw_snapshot_dir }}/_domain_{{ ad_domain_fqdn }}/{{ dw_run_id }}.json
+      — partial={{ (dw_ad_failed_categories | length) > 0 }},
+      failed_categories={{ dw_ad_failed_categories | unique | sort }}

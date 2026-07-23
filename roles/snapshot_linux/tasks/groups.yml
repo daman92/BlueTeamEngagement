@@ -1,0 +1,33 @@
+---
+# tasks/groups.yml — L8b groups (CONTRACTS §3.1 `groups`)
+# identity: name, gid | other: members (sorted list)
+#
+# getent group; membership changes on sudo/wheel/root/adm are the high-value
+# signal (design L8). Record: name | gid | members_csv
+
+- name: L8b collect local groups (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    getent group | while IFS=: read -r gname gpw ggid gmembers; do
+      [ -n "$gname" ] || continue
+      printf '%s\n' "$gname$US$ggid$US$gmembers"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_groups
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L8b stash group records
+  ansible.builtin.set_fact:
+    dw_raw_groups: "{{ dw_groups.stdout | default('') }}"
+
+- name: L8b mark groups failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['groups'] }}"
+  when: (dw_groups.rc | default(1)) != 0

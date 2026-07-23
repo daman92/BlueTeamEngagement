@@ -1,0 +1,42 @@
+---
+# W9b local_groups (CONTRACTS §3.2 `local_groups`)
+# identity: group, member_sid | other: member_name, member_class
+#
+# Members of the four privilege-bearing local groups (design W9). Get-LocalGroupMember can
+# throw on groups holding unresolvable domain SIDs — that is caught per group so one bad
+# group does not lose the rest.
+
+- name: "W9b local privileged groups"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+      $groups = @('Administrators', 'Remote Desktop Users', 'Remote Management Users', 'Backup Operators')
+      foreach ($g in $groups) {
+        $members = $null
+        try { $members = Get-LocalGroupMember -Group $g -ErrorAction Stop } catch { $members = $null }
+        if ($members) {
+          foreach ($m in $members) {
+            $msid = $null
+            try { $msid = "$($m.SID.Value)" } catch {}
+            [void]$out.Add([ordered]@{
+              group        = $g
+              member_sid   = $msid
+              member_name  = $m.Name
+              member_class = "$($m.ObjectClass)"
+            })
+          }
+        }
+      }
+      $out
+  register: reg_local_groups
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record local_groups collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['local_groups'] }}"
+  when: reg_local_groups is failed

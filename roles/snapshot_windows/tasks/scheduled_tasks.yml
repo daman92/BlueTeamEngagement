@@ -1,0 +1,77 @@
+---
+# W5 scheduled_tasks (CONTRACTS §3.2 `scheduled_tasks`)
+# identity: task_path, action_exe, action_args, principal | volatile: last_run, next_run
+# other:    state, xml_hash, triggers, author
+#
+# One row per action (a task may define several). xml_hash is the sha256 of the exported
+# task XML (Export-ScheduledTask returns the XML as text — a read, no file is written).
+
+- name: "W5 scheduled tasks"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+      foreach ($t in (Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+        $taskPath = "$($t.TaskPath)$($t.TaskName)"
+
+        $principal = $null
+        if ($t.Principal) {
+          if ($t.Principal.UserId)        { $principal = $t.Principal.UserId }
+          elseif ($t.Principal.GroupId)   { $principal = $t.Principal.GroupId }
+          else                            { $principal = "$($t.Principal.LogonType)" }
+        }
+
+        $triggers = @()
+        try {
+          foreach ($tr in @($t.Triggers)) {
+            if ($tr -and $tr.CimClass) { $triggers += "$($tr.CimClass.CimClassName)" }
+          }
+        } catch {}
+
+        $xmlHash = $null
+        try {
+          $xml = Export-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop
+          if ($xml) {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$xml)
+            $xmlHash = ([System.BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLower()
+            $sha.Dispose()
+          }
+        } catch {}
+
+        $lastRun = $null; $nextRun = $null
+        try {
+          $info = Get-ScheduledTaskInfo -TaskName $t.TaskName -TaskPath $t.TaskPath -ErrorAction Stop
+          if ($info.LastRunTime) { $lastRun = $info.LastRunTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+          if ($info.NextRunTime) { $nextRun = $info.NextRunTime.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+        } catch {}
+
+        $actions = @($t.Actions)
+        if (-not $actions -or $actions.Count -eq 0) {
+          [void]$out.Add([ordered]@{
+            task_path = $taskPath; action_exe = $null; action_args = $null; principal = $principal
+            last_run = $lastRun; next_run = $nextRun; state = "$($t.State)"; xml_hash = $xmlHash
+            triggers = @($triggers); author = $t.Author
+          })
+        } else {
+          foreach ($a in $actions) {
+            [void]$out.Add([ordered]@{
+              task_path = $taskPath; action_exe = $a.Execute; action_args = $a.Arguments; principal = $principal
+              last_run = $lastRun; next_run = $nextRun; state = "$($t.State)"; xml_hash = $xmlHash
+              triggers = @($triggers); author = $t.Author
+            })
+          }
+        }
+      }
+      $out
+  register: reg_scheduled_tasks
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record scheduled_tasks collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['scheduled_tasks'] }}"
+  when: reg_scheduled_tasks is failed

@@ -1,0 +1,41 @@
+---
+# tasks/kernel_state.yml — L11b kernel taint & security sysctls
+# (CONTRACTS §3.1 `kernel_state`)
+# object category — fields: tainted, sysctls (dict)
+#
+# /proc/sys/kernel/tainted plus the security-relevant sysctl set from
+# dw_snapshot_linux_sysctls (ip_forward, kptr_restrict, module signing state, ...).
+# Falls back to reading /proc/sys directly where the sysctl binary is absent.
+# Records:  tainted | <value>   ·   sysctl | <key> | <value>
+
+- name: L11b collect kernel taint and sysctls (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    printf '%s\n' "tainted$US$(cat /proc/sys/kernel/tainted 2>/dev/null)"
+    for k in {{ dw_snapshot_linux_sysctls | join(' ') }}; do
+      v=$(sysctl -n "$k" 2>/dev/null | tr '\t' ' ')
+      if [ -z "$v" ]; then
+        pth="/proc/sys/$(printf '%s' "$k" | tr . /)"
+        [ -r "$pth" ] && v=$(tr '\t' ' ' < "$pth" 2>/dev/null)
+      fi
+      printf '%s\n' "sysctl$US$k$US$v"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_kstate
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L11b stash kernel state records
+  ansible.builtin.set_fact:
+    dw_raw_kernel_state: "{{ dw_kstate.stdout | default('') }}"
+
+- name: L11b mark kernel_state failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['kernel_state'] }}"
+  when: (dw_kstate.rc | default(1)) != 0

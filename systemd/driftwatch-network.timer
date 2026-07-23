@@ -1,0 +1,16 @@
+[Unit]
+Description=driftwatch network-device collection cadence (every 2h, offset from the fast set)
+Documentation=file:///opt/driftwatch/systemd/README.md
+
+[Timer]
+# Configs are small; diff often (design §4.3). Offset one hour from the fast timer so the two
+# do not contend for the control node at the same instant (bin/driftwatch also holds a
+# per-engagement lock, so an overlap is serialized rather than doubled).
+OnCalendar=*-*-* 01/2:00:00
+RandomizedDelaySec=300
+AccuracySec=1min
+Persistent=true
+Unit=driftwatch-network.service
+
+[Install]
+WantedBy=timers.target

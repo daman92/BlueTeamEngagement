@@ -1,0 +1,47 @@
+---
+# tasks/kernel_modules.yml — L11a loaded kernel modules (CONTRACTS §3.1 `kernel_modules`)
+# identity: name | volatile: size, used_by | other: sha256
+#
+# lsmod for the loaded set; on-disk module file hashes (modinfo -n -> sha256sum)
+# only when the hash gate is open (dw_deep / hash_policy full — design §4.1 L11:
+# an unexpected module is Critical rootkit surface, and the hash pins its
+# identity). Compressed modules (.ko.xz/.ko.zst) are hashed as stored on disk.
+# Record: name | size | used_by | sha256
+
+- name: L11a collect loaded kernel modules (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    DO_HASH={{ (dw_snapshot_linux_do_hash | trim | bool) | ternary('1', '0') }}
+    lsmod 2>/dev/null | awk 'NR>1' | while IFS= read -r ml; do
+      name=$(printf '%s' "$ml" | awk '{print $1}')
+      [ -n "$name" ] || continue
+      size=$(printf '%s' "$ml" | awk '{print $2}')
+      used=$(printf '%s' "$ml" | awk '{print $4}')
+      sha=""
+      if [ "$DO_HASH" = "1" ]; then
+        mp=$(modinfo -n "$name" 2>/dev/null)
+        case "$mp" in
+          /*) [ -f "$mp" ] && sha=$(sha256sum "$mp" 2>/dev/null | awk '{print $1}') ;;
+        esac
+      fi
+      printf '%s\n' "$name$US$size$US$used$US$sha"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_kmods
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L11a stash kernel module records
+  ansible.builtin.set_fact:
+    dw_raw_kernel_modules: "{{ dw_kmods.stdout | default('') }}"
+
+- name: L11a mark kernel_modules failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['kernel_modules'] }}"
+  when: (dw_kmods.rc | default(1)) != 0

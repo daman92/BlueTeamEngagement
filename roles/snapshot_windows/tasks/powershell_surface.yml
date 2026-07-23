@@ -1,0 +1,66 @@
+---
+# W16 powershell_surface (CONTRACTS §3.2 `powershell_surface`, OBJECT category)
+# fields: execution_policy, profiles (list of {path, sha256}), psv2_enabled,
+#         scriptblock_logging, transcription
+
+- name: "W16 PowerShell surface"
+  ansible.windows.win_powershell:
+    depth: 6
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $execPolicy = $null
+      try { $execPolicy = "$(Get-ExecutionPolicy)" } catch {}
+
+      $profilePaths = @()
+      try {
+        $profilePaths = @(
+          $PROFILE.AllUsersAllHosts,
+          $PROFILE.AllUsersCurrentHost,
+          $PROFILE.CurrentUserAllHosts,
+          $PROFILE.CurrentUserCurrentHost
+        )
+      } catch {}
+      $profiles = New-Object System.Collections.ArrayList
+      foreach ($pp in ($profilePaths | Where-Object { $_ } | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $pp -PathType Leaf) {
+          $h = $null
+          try { $h = (Get-FileHash -LiteralPath $pp -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+          [void]$profiles.Add([ordered]@{ path = $pp; sha256 = $h })
+        }
+      }
+
+      $psv2 = $false
+      try {
+        $eng = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\PowerShell\1\PowerShellEngine' -ErrorAction SilentlyContinue
+        if ($eng -and "$($eng.PowerShellVersion)" -like '2.*') { $psv2 = $true }
+      } catch {}
+
+      $sbl = $false
+      try {
+        $r = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging' -ErrorAction SilentlyContinue
+        if ($r -and $r.EnableScriptBlockLogging -eq 1) { $sbl = $true }
+      } catch {}
+
+      $trans = $false
+      try {
+        $r = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' -ErrorAction SilentlyContinue
+        if ($r -and $r.EnableTranscripting -eq 1) { $trans = $true }
+      } catch {}
+
+      [ordered]@{
+        execution_policy    = $execPolicy
+        profiles            = @($profiles)
+        psv2_enabled        = [bool]$psv2
+        scriptblock_logging = [bool]$sbl
+        transcription       = [bool]$trans
+      }
+  register: reg_powershell_surface
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record powershell_surface collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['powershell_surface'] }}"
+  when: reg_powershell_surface is failed

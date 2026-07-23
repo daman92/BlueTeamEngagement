@@ -1,0 +1,98 @@
+---
+# tasks/persistence.yml — L7 other persistence surfaces (CONTRACTS §3.1 `persistence`)
+# identity: mechanism, path | other: content_hash, present
+# mechanism: ld_so_preload | ld_preload_env | profile_d | rc_local | init_d |
+#            udev_rule | motd_script | shell_rc
+#
+# Sentinel files (/etc/ld.so.preload, rc.local variants, the tracked shell rc set)
+# are ALWAYS emitted with a present flag — so `present` flipping false->true is a
+# `changed` finding, and the policy rule `policy.linux.ld_so_preload_present`
+# (CONTRACTS §5.1) fires on present == true even on a first run. Directory-based
+# mechanisms emit one hashed record per existing file.
+# Record: mechanism | path | present | content_hash
+
+- name: L7 collect persistence surfaces (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    hash_of() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+    emit() { printf '%s\n' "$1$US$2$US$3$US$4"; }
+
+    # /etc/ld.so.preload existing AT ALL is the critical policy signal
+    if [ -e /etc/ld.so.preload ]; then
+      emit ld_so_preload /etc/ld.so.preload true "$(hash_of /etc/ld.so.preload)"
+    else
+      emit ld_so_preload /etc/ld.so.preload false ""
+    fi
+
+    # LD_PRELOAD injected via environment files or unit envs
+    for f in /etc/environment /etc/security/pam_env.conf; do
+      [ -f "$f" ] || continue
+      if grep -q 'LD_PRELOAD' "$f" 2>/dev/null; then
+        emit ld_preload_env "$f" true "$(hash_of "$f")"
+      fi
+    done
+    grep -rls 'LD_PRELOAD' /etc/systemd/system 2>/dev/null \
+      | LC_ALL=C sort | while IFS= read -r f; do
+          emit ld_preload_env "$f" true "$(hash_of "$f")"
+        done
+
+    # /etc/profile.d scripts (run by every login shell)
+    for f in /etc/profile.d/*; do
+      [ -f "$f" ] || continue
+      emit profile_d "$f" true "$(hash_of "$f")"
+    done
+
+    # rc.local variants (sentinels: emitted even when absent)
+    for f in /etc/rc.local /etc/rc.d/rc.local; do
+      if [ -f "$f" ]; then
+        emit rc_local "$f" true "$(hash_of "$f")"
+      else
+        emit rc_local "$f" false ""
+      fi
+    done
+
+    # legacy init scripts
+    for f in /etc/init.d/*; do
+      [ -f "$f" ] || continue
+      emit init_d "$f" true "$(hash_of "$f")"
+    done
+
+    # admin-supplied udev rules (RUN+= is code execution on device events)
+    for f in /etc/udev/rules.d/*.rules; do
+      [ -f "$f" ] || continue
+      emit udev_rule "$f" true "$(hash_of "$f")"
+    done
+
+    # MOTD scripts (executed at login on Debian-family hosts)
+    for f in /etc/update-motd.d/*; do
+      [ -f "$f" ] || continue
+      emit motd_script "$f" true "$(hash_of "$f")"
+    done
+
+    # root / service-account shell rc files (fixed sentinel set from defaults)
+    for f in {{ dw_snapshot_linux_shell_rc_files | join(' ') }}; do
+      if [ -f "$f" ]; then
+        emit shell_rc "$f" true "$(hash_of "$f")"
+      else
+        emit shell_rc "$f" false ""
+      fi
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_persist
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L7 stash persistence records
+  ansible.builtin.set_fact:
+    dw_raw_persistence: "{{ dw_persist.stdout | default('') }}"
+
+- name: L7 mark persistence failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['persistence'] }}"
+  when: (dw_persist.rc | default(1)) != 0

@@ -1,0 +1,52 @@
+---
+# tasks/users.yml — L8a users (CONTRACTS §3.1 `users`)
+# identity: name, uid | volatile: last_login
+# other: gid, shell, home, locked, pw_last_set, home_ctime, groups (sorted list)
+#
+# getent passwd for the account list; /etc/shadow (via getent shadow, root only)
+# for DATES AND FLAGS ONLY — password hashes are NEVER read out (design L8).
+# Linux stores no account-creation date, so home-dir ctime is recorded as the
+# documented approximation. Record (last_login before groups — both are the
+# free-ish fields, groups is a comma list):
+#   name | uid | gid | shell | home | locked | pw_last_set | home_ctime | last_login | groups_csv
+
+- name: L8a collect local users (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    getent passwd | while IFS=: read -r name pw uid gid gecos home shellp; do
+      locked=false; pls=""
+      sline=$(getent shadow "$name" 2>/dev/null)
+      if [ -n "$sline" ]; then
+        spw=$(printf '%s' "$sline" | cut -d: -f2)
+        days=$(printf '%s' "$sline" | cut -d: -f3)
+        case "$spw" in '!'*|'*') locked=true ;; esac
+        if [ -n "$days" ] && [ "$days" -ge 0 ] 2>/dev/null; then
+          pls=$(date -u -d "@$((days * 86400))" +%Y-%m-%d 2>/dev/null) || pls="$days"
+        fi
+      fi
+      hct=""
+      [ -d "$home" ] && hct=$(stat -c %z "$home" 2>/dev/null)
+      ll=$(lastlog -u "$name" 2>/dev/null | awk 'NR==2 { $1=""; sub(/^ +/,""); print }')
+      case "$ll" in *"Never logged in"*) ll="" ;; esac
+      grps=$(id -Gn "$name" 2>/dev/null | tr ' ' ',')
+      printf '%s\n' "$name$US$uid$US$gid$US$shellp$US$home$US$locked$US$pls$US$hct$US$ll$US$grps"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_users
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L8a stash user records
+  ansible.builtin.set_fact:
+    dw_raw_users: "{{ dw_users.stdout | default('') }}"
+
+- name: L8a mark users failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['users'] }}"
+  when: (dw_users.rc | default(1)) != 0

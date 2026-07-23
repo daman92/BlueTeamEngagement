@@ -1,0 +1,8 @@
+{#
+  driftwatch Windows snapshot document (CONTRACTS §2 / §3.2).
+  The full document is assembled in tasks/assemble.yml as the `dw_snapshot` fact:
+  meta + exactly the windows category keys. Rendering it through to_nice_json here
+  keeps the on-disk snapshot raw and deterministic; the control-node normalizer
+  (scripts/normalize.py) sorts/strips volatile fields at diff time, not the role.
+#}
+{{ dw_snapshot | to_nice_json }}

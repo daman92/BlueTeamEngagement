@@ -1,0 +1,79 @@
+---
+# snapshot_windows — read-only Windows collector (design §4.2 W1-W17, CONTRACTS §3.2).
+#
+# Read-only by construction (enforced by scripts/lint_readonly.py, a security control per
+# design §15.3): every collection task is `ansible.windows.win_powershell` carrying the
+# `readonly` tag, asserting the PowerShell only reads. The ONLY writes are the snapshot
+# assembly at the end, delegated to localhost (control node), never to the target.
+#
+# A failed category never fails the play (CONTRACTS §1.5): each collection task has
+# ignore_errors, and its category name is recorded in dw_failed_categories so the final
+# document is marked meta.partial with meta.failed_categories populated.
+
+- name: Initialize snapshot assembly state
+  ansible.builtin.set_fact:
+    dw_failed_categories: []
+
+- name: Collect host meta (OS, hostname, collection time)
+  ansible.windows.win_powershell:
+    depth: 3
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+      $os = $null
+      try {
+        $o = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $os = ("$($o.Caption) $($o.Version)").Trim()
+      } catch { $os = 'Windows' }
+      [ordered]@{
+        os           = $os
+        hostname     = $env:COMPUTERNAME
+        collected_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+      }
+  register: reg_hostmeta
+  ignore_errors: true
+  tags: [readonly]
+
+# --- Category fragments (one registered win_powershell read per category) --------------
+- name: "W1  - Running processes"
+  ansible.builtin.include_tasks: processes.yml
+- name: "W2  - Fileless indicators"
+  ansible.builtin.include_tasks: fileless.yml
+- name: "W3  - Listening ports"
+  ansible.builtin.include_tasks: listening.yml
+- name: "W4  - Active connections"
+  ansible.builtin.include_tasks: connections.yml
+- name: "W5  - Scheduled tasks"
+  ansible.builtin.include_tasks: scheduled_tasks.yml
+- name: "W6  - Services"
+  ansible.builtin.include_tasks: services.yml
+- name: "W7  - Autoruns"
+  ansible.builtin.include_tasks: autoruns.yml
+- name: "W8  - WMI event subscriptions"
+  ansible.builtin.include_tasks: wmi_subscriptions.yml
+- name: "W9a - Local users"
+  ansible.builtin.include_tasks: users.yml
+- name: "W9b - Local privileged groups"
+  ansible.builtin.include_tasks: local_groups.yml
+- name: "W10 - Drivers"
+  ansible.builtin.include_tasks: drivers.yml
+- name: "W11a- Installed software"
+  ansible.builtin.include_tasks: software.yml
+- name: "W11b- Hotfixes"
+  ansible.builtin.include_tasks: hotfixes.yml
+- name: "W12 - Host firewall"
+  ansible.builtin.include_tasks: firewall.yml
+- name: "W13 - DNS / hosts / proxy / trust store"
+  ansible.builtin.include_tasks: dns_trust.yml
+- name: "W14 - Audit & logging health"
+  ansible.builtin.include_tasks: audit_logging.yml
+- name: "W15 - Shares"
+  ansible.builtin.include_tasks: shares.yml
+- name: "W16 - PowerShell surface"
+  ansible.builtin.include_tasks: powershell_surface.yml
+- name: "W17 - Security posture"
+  ansible.builtin.include_tasks: security_posture.yml
+
+# --- Assemble on the control node and write the snapshot document ----------------------
+- name: "Assemble and write the snapshot document"
+  ansible.builtin.include_tasks: assemble.yml

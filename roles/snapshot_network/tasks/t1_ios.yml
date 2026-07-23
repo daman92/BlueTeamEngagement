@@ -1,0 +1,577 @@
+---
+# roles/snapshot_network/tasks/t1_ios.yml
+#
+# Tier-1 worked example: Cisco IOS / IOS-XE via the cisco.ios collection and
+# ansible.netcommon.cli_command. READ ONLY — facts + `show` commands only, never
+# an ios_config/*_config module. Every command task is tagged `readonly`.
+#
+# Produces the full CONTRACTS.md §3.4 `network` category set (device_config is
+# assembled from dw_net_config_raw by tasks/main.yml after sanitization). A
+# source command that errors is caught by `ignore_errors` and its category is
+# recorded in dw_failed_categories at the end — the play never fails.
+#
+# Additional T1 handlers (t1_nxos.yml / t1_eos.yml / t1_junos.yml) would follow
+# this exact shape; only IOS ships as the worked example in v1.
+
+# --------------------------------------------------------------------------- #
+# Facts (min = version/hostname/image; interfaces = interface + neighbor tables)
+# --------------------------------------------------------------------------- #
+- name: Gather Cisco IOS facts
+  cisco.ios.ios_facts:
+    gather_subset:
+      - min
+      - interfaces
+  register: r_ios_facts
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Derive detected OS string
+  ansible.builtin.set_fact:
+    dw_net_detected_os: "{{ ('IOS ' ~ (ansible_net_version | default(''))) | trim }}"
+
+# --------------------------------------------------------------------------- #
+# Read-only show commands (each registered; failures tolerated)
+# --------------------------------------------------------------------------- #
+- name: Collect running configuration
+  ansible.netcommon.cli_command:
+    command: "show running-config"
+  register: r_run
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect startup configuration
+  ansible.netcommon.cli_command:
+    command: "show startup-config"
+  register: r_start
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect archive config change log
+  ansible.netcommon.cli_command:
+    command: "show archive log config all"
+  register: r_archlog
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect SSH server state
+  ansible.netcommon.cli_command:
+    command: "show ip ssh"
+  register: r_ssh
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect NTP status
+  ansible.netcommon.cli_command:
+    command: "show ntp status"
+  register: r_ntp
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect SPAN/RSPAN monitor sessions
+  ansible.netcommon.cli_command:
+    command: "show monitor session all"
+  register: r_monitor
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect spanning-tree root information
+  ansible.netcommon.cli_command:
+    command: "show spanning-tree root"
+  register: r_stproot
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect trunk interfaces
+  ansible.netcommon.cli_command:
+    command: "show interfaces trunk"
+  register: r_trunk
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect MAC address-table counts (volatile)
+  ansible.netcommon.cli_command:
+    command: "show mac address-table count"
+  register: r_maccount
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect port-security state
+  ansible.netcommon.cli_command:
+    command: "show port-security"
+  register: r_portsec
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect DHCP snooping state
+  ansible.netcommon.cli_command:
+    command: "show ip dhcp snooping"
+  register: r_dhcpsnoop
+  ignore_errors: true
+  tags: [readonly]
+
+- name: Collect dynamic ARP inspection state
+  ansible.netcommon.cli_command:
+    command: "show ip arp inspection"
+  register: r_arpinsp
+  ignore_errors: true
+  tags: [readonly]
+
+# Deep-only (potentially large) categories — gated by dw_deep (design §8 cadence)
+- name: Collect access-lists (deep)
+  ansible.netcommon.cli_command:
+    command: "show access-lists"
+  register: r_acl
+  ignore_errors: true
+  when: dw_deep | bool
+  tags: [readonly]
+
+- name: Collect OSPF neighbors (deep)
+  ansible.netcommon.cli_command:
+    command: "show ip ospf neighbor"
+  register: r_ospf
+  ignore_errors: true
+  when: dw_deep | bool
+  tags: [readonly]
+
+- name: Collect BGP summary (deep)
+  ansible.netcommon.cli_command:
+    command: "show ip bgp summary"
+  register: r_bgp
+  ignore_errors: true
+  when: dw_deep | bool
+  tags: [readonly]
+
+# --------------------------------------------------------------------------- #
+# Raw running config -> handed to tasks/main.yml for sanitize + device_config
+# --------------------------------------------------------------------------- #
+- name: Capture raw running config for sanitization
+  ansible.builtin.set_fact:
+    dw_net_config_raw: "{{ r_run.stdout | default('') }}"
+
+# --------------------------------------------------------------------------- #
+# Initialize every category to its empty shape (so parses can append safely)
+# --------------------------------------------------------------------------- #
+- name: Initialize category accumulators
+  ansible.builtin.set_fact:
+    dw_cat_local_accounts: []
+    dw_cat_snmp: []
+    dw_cat_static_routes: []
+    dw_cat_routing_neighbors: []
+    dw_cat_firewall_rules: []
+    dw_cat_nat_rules: []
+    dw_cat_vpn_peers: []
+    dw_cat_tunnels: []
+    dw_cat_mirror_sessions: []
+    dw_cat_interfaces: []
+    dw_cat_neighbors: []
+    dw_prov_entries: []
+
+# --------------------------------------------------------------------------- #
+# local_accounts (identity: username; secret_hash is salted, never the secret)
+# --------------------------------------------------------------------------- #
+- name: Parse local accounts
+  ansible.builtin.set_fact:
+    dw_cat_local_accounts: >-
+      {{ dw_cat_local_accounts + [ {
+           'username': item.0,
+           'privilege': (item.1 if (item.1 | length > 0) else '1'),
+           'secret_hash': (((dw_redaction_salt ~ item.2) | hash('sha256')) if (item.2 | length > 0) else '')
+         } ] }}
+  loop: >-
+    {{ (r_run.stdout | default(''))
+       | regex_findall('(?m)^username (\\S+)(?: privilege (\\d+))?(?: (?:secret|password) \\d+ (\\S+))?') }}
+  loop_control:
+    label: "{{ item.0 }}"
+
+# --------------------------------------------------------------------------- #
+# aaa (method lists + TACACS/RADIUS servers)
+# --------------------------------------------------------------------------- #
+- name: Parse AAA
+  ansible.builtin.set_fact:
+    dw_cat_aaa:
+      method_lists: >-
+        {{ dict((r_run.stdout | default('')) | regex_findall('(?m)^aaa authentication login (\\S+) (.+)$')) }}
+      tacacs_servers: >-
+        {{ ((r_run.stdout | default('')) | regex_findall('(?im)^tacacs-server host (\\S+)')
+            + (r_run.stdout | default('')) | regex_findall('(?im)^\\s*address ipv4 (\\S+)')) | unique | sort }}
+      radius_servers: >-
+        {{ ((r_run.stdout | default('')) | regex_findall('(?im)^radius-server host (\\S+)')) | unique | sort }}
+
+# --------------------------------------------------------------------------- #
+# mgmt_services (telnet / http / https / ssh / vty_acl)
+# --------------------------------------------------------------------------- #
+- name: Parse management-plane services
+  ansible.builtin.set_fact:
+    dw_cat_mgmt_services:
+      - service: "telnet"
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?is)line vty.*?transport input[^\\n]*telnet')) is not none }}"
+        detail: "vty transport input"
+      - service: "http"
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?m)^ip http server')) is not none }}"
+        detail: ""
+      - service: "https"
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?m)^ip http secure-server')) is not none }}"
+        detail: ""
+      - service: "ssh"
+        enabled: "{{ ((r_ssh.stdout | default('')) | regex_search('(?i)SSH (?:Enabled|version)')) is not none }}"
+        detail: "{{ ((r_ssh.stdout | default('')) | regex_search('(?im)^SSH[^\\n]*version[^\\n]*')) | default('', true) }}"
+      - service: "vty_acl"
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?m)^ *access-class \\S+ in')) is not none }}"
+        detail: "{{ ((r_run.stdout | default('')) | regex_search('(?m)^ *access-class \\S+ in')) | default('', true) }}"
+
+# --------------------------------------------------------------------------- #
+# snmp (community keys salted; v3 users; trap targets)
+# --------------------------------------------------------------------------- #
+- name: Parse SNMP communities
+  ansible.builtin.set_fact:
+    dw_cat_snmp: >-
+      {{ dw_cat_snmp + [ {
+           'kind': 'community',
+           'key': (dw_redaction_salt ~ item.0) | hash('sha256'),
+           'access': (item.1 if (item.1 | length > 0) else 'RO'),
+           'targets': []
+         } ] }}
+  loop: >-
+    {{ (r_run.stdout | default('')) | regex_findall('(?m)^snmp-server community (\\S+)(?: (RO|RW))?(?: (\\S+))?') }}
+  loop_control:
+    label: "community"
+
+- name: Parse SNMPv3 users
+  ansible.builtin.set_fact:
+    dw_cat_snmp: >-
+      {{ dw_cat_snmp + [ {
+           'kind': 'v3_user',
+           'key': item.0,
+           'access': (item.1 | default('', true)),
+           'targets': []
+         } ] }}
+  loop: >-
+    {{ (r_run.stdout | default('')) | regex_findall('(?m)^snmp-server user (\\S+)(?: (\\S+))?') }}
+  loop_control:
+    label: "{{ item.0 }}"
+
+- name: Parse SNMP trap targets
+  ansible.builtin.set_fact:
+    dw_cat_snmp: >-
+      {{ dw_cat_snmp + [ {
+           'kind': 'trap_target',
+           'key': item,
+           'access': '',
+           'targets': [ item ]
+         } ] }}
+  loop: >-
+    {{ (r_run.stdout | default('')) | regex_findall('(?m)^snmp-server host (\\S+)') }}
+  loop_control:
+    label: "{{ item }}"
+
+# --------------------------------------------------------------------------- #
+# logging_time (syslog targets / level / NTP servers / sync state)
+# --------------------------------------------------------------------------- #
+- name: Parse logging and time
+  ansible.builtin.set_fact:
+    dw_cat_logging_time:
+      syslog_targets: >-
+        {{ ((r_run.stdout | default('')) | regex_findall('(?im)^logging host (\\S+)')
+            + (r_run.stdout | default('')) | regex_findall('(?im)^logging (\\d+\\.\\d+\\.\\d+\\.\\d+)')) | unique | sort }}
+      logging_level: >-
+        {{ (((r_run.stdout | default('')) | regex_findall('(?im)^logging trap (\\S+)')) | first) | default('informational', true) }}
+      ntp_servers: >-
+        {{ ((r_run.stdout | default('')) | regex_findall('(?im)^ntp server (?:vrf \\S+ )?(\\S+)')) | unique | sort }}
+      ntp_synced: "{{ ((r_ntp.stdout | default('')) | regex_search('(?i)Clock is synchronized')) is not none }}"
+
+# --------------------------------------------------------------------------- #
+# interfaces (from facts; counters/last_flap kept raw — normalize.py strips them)
+# --------------------------------------------------------------------------- #
+- name: Build interfaces from IOS facts
+  ansible.builtin.set_fact:
+    dw_cat_interfaces: >-
+      {{ dw_cat_interfaces + [ {
+           'name': item.key,
+           'admin_status': ('down' if ('admin' in ((item.value.operstatus | default('')) | lower)) else 'up'),
+           'oper_status': ('up' if (((item.value.operstatus | default('')) | lower) == 'up') else 'down'),
+           'description': (item.value.description | default('')),
+           'vlan': '',
+           'mode': '',
+           'ip': (((item.value.ipv4 | default([])) | map(attribute='address') | list | first) | default('', true)),
+           'counters': {},
+           'last_flap': ''
+         } ] }}
+  loop: "{{ (ansible_net_interfaces | default({})) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# --------------------------------------------------------------------------- #
+# neighbors (CDP/LLDP from facts)
+# --------------------------------------------------------------------------- #
+- name: Build neighbors from IOS facts
+  ansible.builtin.set_fact:
+    dw_cat_neighbors: >-
+      {{ dw_cat_neighbors + [ {
+           'local_interface': item.0.key,
+           'remote_device': (item.1.host | default('')),
+           'remote_port': (item.1.port | default('')),
+           'platform': '',
+           'capabilities': ''
+         } ] }}
+  loop: "{{ (ansible_net_neighbors | default({})) | dict2items | subelements('value', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.0.key }}"
+
+# --------------------------------------------------------------------------- #
+# tunnels (GRE/IPIP/VXLAN interfaces — identity is name)
+# --------------------------------------------------------------------------- #
+- name: Parse tunnel interfaces
+  ansible.builtin.set_fact:
+    dw_cat_tunnels: >-
+      {{ dw_cat_tunnels + [ { 'name': ('Tunnel' ~ item), 'kind': 'gre', 'src': '', 'dst': '' } ] }}
+  loop: "{{ (r_run.stdout | default('')) | regex_findall('(?im)^interface Tunnel(\\d+)') }}"
+  loop_control:
+    label: "Tunnel{{ item }}"
+
+# --------------------------------------------------------------------------- #
+# mirror_sessions (SPAN/RSPAN — presence is the key finding)
+# --------------------------------------------------------------------------- #
+- name: Parse SPAN/monitor sessions
+  ansible.builtin.set_fact:
+    dw_cat_mirror_sessions: >-
+      {{ dw_cat_mirror_sessions + [ { 'session_id': item, 'src': '', 'dst': '', 'kind': 'span' } ] }}
+  loop: "{{ (r_monitor.stdout | default('')) | regex_findall('(?im)^Session (\\d+)') }}"
+  loop_control:
+    label: "session {{ item }}"
+
+# --------------------------------------------------------------------------- #
+# l2_state (STP root per VLAN, trunks; mac_count_per_vlan is VOLATILE)
+# --------------------------------------------------------------------------- #
+- name: Parse L2 state
+  ansible.builtin.set_fact:
+    dw_cat_l2_state:
+      # Root ID = "<priority> <bridge MAC>": capture BOTH so a root hijack at
+      # equal priority (different MAC) still changes the value (§3.4 vlan->bridge_id).
+      stp_root: >-
+        {{ dict((r_stproot.stdout | default(''))
+                | regex_findall('(?im)^\\s*VLAN0*(\\d+)\\s+(\\d+ +[0-9a-f]{4}\\.[0-9a-f]{4}\\.[0-9a-f]{4})')) }}
+      trunks: >-
+        {{ ((r_trunk.stdout | default('')) | regex_findall('(?im)^(\\S+)\\s+\\S+\\s+trunking')) | unique | sort }}
+      mac_count_per_vlan: >-
+        {{ dict((r_maccount.stdout | default('')) | regex_findall('(?im)^\\s*(?:Vlan\\s+)?(\\d+)\\s+(\\d+)')) }}
+
+# --------------------------------------------------------------------------- #
+# static_routes (identity: prefix, next_hop)
+# --------------------------------------------------------------------------- #
+- name: Parse static routes
+  ansible.builtin.set_fact:
+    dw_cat_static_routes: >-
+      {{ dw_cat_static_routes + [ {
+           'prefix': (item.0 ~ ' ' ~ item.1),
+           'next_hop': item.2,
+           'interface': (item.2 if ((item.2 | regex_search('^[A-Za-z]')) is not none) else ''),
+           'metric': (item.3 if (item.3 | length > 0) else '')
+         } ] }}
+  loop: >-
+    {{ (r_run.stdout | default('')) | regex_findall('(?m)^ip route (\\S+) (\\S+) (\\S+)(?: (\\d+))?') }}
+  loop_control:
+    label: "{{ item.0 }}"
+
+# --------------------------------------------------------------------------- #
+# routing_neighbors (deep; state/uptime VOLATILE)
+# --------------------------------------------------------------------------- #
+- name: Parse OSPF neighbors
+  ansible.builtin.set_fact:
+    dw_cat_routing_neighbors: >-
+      {{ dw_cat_routing_neighbors + [ {
+           'protocol': 'ospf', 'peer': item.0, 'state': item.1, 'uptime': '',
+           'remote_as': '', 'interface': item.2
+         } ] }}
+  loop: >-
+    {{ (r_ospf.stdout | default('')) | regex_findall('(?im)^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\S+?)\\S*\\s+\\S+\\s+\\S+\\s+(\\S+)') }}
+  loop_control:
+    label: "ospf {{ item.0 }}"
+  when: dw_deep | bool
+
+- name: Parse BGP neighbors
+  ansible.builtin.set_fact:
+    dw_cat_routing_neighbors: >-
+      {{ dw_cat_routing_neighbors + [ {
+           'protocol': 'bgp', 'peer': item.0, 'state': 'established', 'uptime': item.2,
+           'remote_as': item.1, 'interface': ''
+         } ] }}
+  loop: >-
+    {{ (r_bgp.stdout | default('')) | regex_findall('(?im)^(\\d+\\.\\d+\\.\\d+\\.\\d+)\\s+\\d+\\s+(\\d+)\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+(\\S+)') }}
+  loop_control:
+    label: "bgp {{ item.0 }}"
+  when: dw_deep | bool
+
+# --------------------------------------------------------------------------- #
+# firewall_rules (deep; ACLs. rule_hash = sha256 of normalized rule text; hits VOLATILE)
+# --------------------------------------------------------------------------- #
+- name: Parse ACL rule base
+  ansible.builtin.set_fact:
+    dw_cat_firewall_rules: >-
+      {{ dw_cat_firewall_rules + [ {
+           'rule_hash': (item | trim) | hash('sha256'),
+           'rule_text': (item | trim),
+           'action': ('permit' if ('permit' in item) else ('deny' if ('deny' in item) else '')),
+           'src': '',
+           'dst': '',
+           'port': '',
+           'enabled': true,
+           'hits': 0
+         } ] }}
+  loop: "{{ (r_acl.stdout | default('')) | regex_findall('(?im)^\\s+\\d+ ((?:permit|deny) .*)$') }}"
+  loop_control:
+    label: "acl rule"
+  when: dw_deep | bool
+
+# --------------------------------------------------------------------------- #
+# nat_rules (rule_hash = sha256 of normalized rule text)
+# --------------------------------------------------------------------------- #
+- name: Parse static NAT rules
+  ansible.builtin.set_fact:
+    dw_cat_nat_rules: >-
+      {{ dw_cat_nat_rules + [ {
+           'rule_hash': (('ip nat ' ~ (item | trim)) | hash('sha256')),
+           'rule_text': ('ip nat ' ~ (item | trim)),
+           'direction': ('inside' if (item is search('inside')) else ('outside' if (item is search('outside')) else '')),
+           'external': '',
+           'internal': ''
+         } ] }}
+  loop: "{{ (r_run.stdout | default('')) | regex_findall('(?im)^ip nat (.*)$') }}"
+  loop_control:
+    label: "nat rule"
+
+# --------------------------------------------------------------------------- #
+# vpn_peers (crypto isakmp / IKE peers)
+# --------------------------------------------------------------------------- #
+- name: Parse VPN peers
+  ansible.builtin.set_fact:
+    dw_cat_vpn_peers: >-
+      {{ dw_cat_vpn_peers + [ { 'peer': item, 'kind': 'ipsec', 'detail': 'crypto isakmp key' } ] }}
+  loop: "{{ (r_run.stdout | default('')) | regex_findall('(?im)^crypto isakmp key \\S+ address (\\S+)') }}"
+  loop_control:
+    label: "{{ item }}"
+
+# --------------------------------------------------------------------------- #
+# software_image (image hash needs `verify` and is left unverified honestly)
+# --------------------------------------------------------------------------- #
+- name: Build software image from IOS facts
+  ansible.builtin.set_fact:
+    dw_cat_software_image:
+      version: "{{ ansible_net_version | default('') }}"
+      image_file: "{{ ansible_net_image | default('') }}"
+      image_hash: ""
+      hash_verified: false
+
+# --------------------------------------------------------------------------- #
+# protection_features (port-security / DHCP snooping / DAI / storm-control)
+# --------------------------------------------------------------------------- #
+- name: Parse protection features
+  ansible.builtin.set_fact:
+    dw_cat_protection_features:
+      port_security:
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?im)^ switchport port-security$')) is not none }}"
+        detail: "{{ ((r_run.stdout | default('')) | regex_findall('(?im)^ switchport port-security$')) | length }} interface(s)"
+      dhcp_snooping:
+        enabled: "{{ ((r_dhcpsnoop.stdout | default('')) | regex_search('(?i)DHCP snooping is (?:enabled|configured|operational)')) is not none }}"
+        detail: ""
+      dai:
+        enabled: "{{ ((r_arpinsp.stdout | default('')) | regex_search('(?i)(?:is )?enabled')) is not none }}"
+        detail: ""
+      storm_control:
+        enabled: "{{ ((r_run.stdout | default('')) | regex_search('(?im)storm-control \\S+ level')) is not none }}"
+        detail: ""
+
+# --------------------------------------------------------------------------- #
+# change_provenance (entries most-recent-first; entries is VOLATILE)
+# --------------------------------------------------------------------------- #
+- name: Parse archive config change log
+  ansible.builtin.set_fact:
+    dw_prov_entries: >-
+      {{ dw_prov_entries + [ { 'idx': item.0, 'user': item.1, 'time': '', 'command': (item.2 | trim) } ] }}
+  loop: >-
+    {{ (r_archlog.stdout | default('')) | regex_findall('(?im)^\\s*(\\d+)\\s+\\S+\\s+(\\S+@?\\S*)\\s+(.*)$') }}
+  loop_control:
+    label: "log {{ item.0 }}"
+
+- name: Assemble change_provenance
+  ansible.builtin.set_fact:
+    dw_cat_change_provenance:
+      last_change_user: "{{ ((dw_prov_entries | reverse | list) | map(attribute='user') | first) | default('', true) }}"
+      last_change_time: ""
+      entries: "{{ dw_prov_entries | reverse | list }}"
+
+# --------------------------------------------------------------------------- #
+# config_saved (running vs startup; secret-bearing lines kept out of diff_lines)
+# --------------------------------------------------------------------------- #
+- name: Parse config_saved (running vs startup)
+  ansible.builtin.set_fact:
+    dw_cat_config_saved:
+      in_sync: "{{ (cs_added | length == 0) and (cs_removed | length == 0) }}"
+      diff_lines: >-
+        {{ (cs_added | map('regex_replace', '^', '+ ') | list)
+           + (cs_removed | map('regex_replace', '^', '- ') | list) }}
+  vars:
+    cs_run: >-
+      {{ (r_run.stdout | default('')).splitlines()
+         | reject('regex', dw_net_volatile_combined)
+         | reject('regex', dw_net_secret_indicator) | list }}
+    cs_start: >-
+      {{ (r_start.stdout | default('')).splitlines()
+         | reject('regex', dw_net_volatile_combined)
+         | reject('regex', dw_net_secret_indicator) | list }}
+    cs_added: "{{ cs_run | difference(cs_start) }}"
+    cs_removed: "{{ cs_start | difference(cs_run) }}"
+
+# --------------------------------------------------------------------------- #
+# Failure accounting: any category whose source command errored -> failed list
+# --------------------------------------------------------------------------- #
+- name: Account category source-command failures
+  ansible.builtin.set_fact:
+    dw_failed_categories: >-
+      {{ (dw_failed_categories + ({
+           'config_saved': ((r_run.failed | default(false)) or (r_start.failed | default(false))),
+           'change_provenance': (r_archlog.failed | default(false)),
+           'local_accounts': (r_run.failed | default(false)),
+           'aaa': (r_run.failed | default(false)),
+           'mgmt_services': (r_run.failed | default(false)),
+           'snmp': (r_run.failed | default(false)),
+           'logging_time': (r_run.failed | default(false)),
+           'static_routes': (r_run.failed | default(false)),
+           'nat_rules': (r_run.failed | default(false)),
+           'tunnels': (r_run.failed | default(false)),
+           'vpn_peers': (r_run.failed | default(false)),
+           'firewall_rules': ((r_acl.failed | default(false)) if (dw_deep | bool) else false),
+           'routing_neighbors': (((r_ospf.failed | default(false)) and (r_bgp.failed | default(false))) if (dw_deep | bool) else false),
+           'mirror_sessions': (r_monitor.failed | default(false)),
+           'l2_state': (r_stproot.failed | default(false)),
+           'software_image': (r_ios_facts.failed | default(false)),
+           'interfaces': (r_ios_facts.failed | default(false)),
+           'neighbors': (r_ios_facts.failed | default(false))
+         } | dict2items | selectattr('value') | map(attribute='key') | list)) | unique | sort }}
+
+# --------------------------------------------------------------------------- #
+# Assemble the category map (device_config is added by tasks/main.yml)
+# --------------------------------------------------------------------------- #
+- name: Assemble Tier-1 category map
+  ansible.builtin.set_fact:
+    dw_net_categories: >-
+      {{ dw_net_categories | combine({
+           'config_saved': dw_cat_config_saved,
+           'change_provenance': dw_cat_change_provenance,
+           'local_accounts': dw_cat_local_accounts,
+           'aaa': dw_cat_aaa,
+           'mgmt_services': dw_cat_mgmt_services,
+           'snmp': dw_cat_snmp,
+           'logging_time': dw_cat_logging_time,
+           'interfaces': dw_cat_interfaces,
+           'tunnels': dw_cat_tunnels,
+           'mirror_sessions': dw_cat_mirror_sessions,
+           'l2_state': dw_cat_l2_state,
+           'static_routes': dw_cat_static_routes,
+           'routing_neighbors': dw_cat_routing_neighbors,
+           'firewall_rules': dw_cat_firewall_rules,
+           'nat_rules': dw_cat_nat_rules,
+           'vpn_peers': dw_cat_vpn_peers,
+           'software_image': dw_cat_software_image,
+           'neighbors': dw_cat_neighbors,
+           'protection_features': dw_cat_protection_features
+         }) }}

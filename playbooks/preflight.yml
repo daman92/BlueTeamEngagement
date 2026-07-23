@@ -1,0 +1,234 @@
+---
+# preflight.yml — verify the Kerberos prerequisites and map every Windows target to the
+# transport it will actually use (design §3.1 + Appendix D.3).
+#
+# The three classic silent-failure modes are checked EXPLICITLY here rather than diagnosed
+# by hand in the middle of a run:
+#   1. DNS pointed at the client's DC   — Windows FQDNs must resolve (Kerberos fails on IPs)
+#   2. clock skew < 5 minutes of the DC — Kerberos rejects skewed tickets
+#   3. a valid TGT                      — `kinit user@REALM` before the run
+#
+# Output: preflight/transport_matrix.json — one row per Windows host, transport =
+#   kerberos | ssh | ntlm | unreachable. A host with `unreachable` is an "authorized but
+#   not assessed" coverage gap (§15.2); the CLI folds these into the run's no_transport list.
+#
+# The play FAILS LOUDLY with specific remediation text when the Kerberos prerequisites are
+# unmet, because Kerberos-over-WinRM is the default rung and knowing on day one beats a
+# confusing auth error on day three. The matrix is written BEFORE that final assertion, so
+# it is available even on a failing preflight.
+#
+# Invoked by: `driftwatch preflight`. Extra vars (dw_engagement, dw_engagement_dir,
+# dw_run_id) are supplied by bin/driftwatch.
+
+- name: Preflight — control-node Kerberos prerequisites
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    dw_clock_skew_max_seconds: 300      # design §3.1: within 5 minutes of the DC
+  tasks:
+    - name: Ensure the preflight output directory exists
+      ansible.builtin.file:
+        path: "{{ dw_engagement_dir }}/preflight"
+        state: directory
+        mode: "0700"
+
+    # --- TGT ----------------------------------------------------------------
+    - name: Check for a valid Kerberos TGT (klist -s)
+      ansible.builtin.command: klist -s
+      register: dw_klist
+      changed_when: false
+      failed_when: false
+
+    - name: Read the ticket cache principal (best effort)
+      ansible.builtin.command: klist
+      register: dw_klist_full
+      changed_when: false
+      failed_when: false
+
+    - name: Record TGT validity
+      ansible.builtin.set_fact:
+        dw_tgt_valid: "{{ dw_klist.rc == 0 }}"
+        dw_tgt_principal: >-
+          {{ (dw_klist_full.stdout | default('') | regex_search('(?i)default principal:\\s*(\\S+)', '\\1') | first)
+             | default('(none)', true) }}
+
+    - name: Remediation — no valid TGT
+      ansible.builtin.debug:
+        msg:
+          - "NO VALID KERBEROS TGT. Kerberos-over-WinRM (the default transport) cannot work."
+          - "Remediate on the kit:"
+          - "  1. Confirm /etc/krb5.conf has the client's realm + KDC (default_realm, [realms])."
+          - "  2. kinit <user>@<REALM.UPPERCASE>   then re-run 'driftwatch preflight'."
+          - "  3. If kinit fails with 'Cannot find KDC', DNS is not pointed at the client DC (see below)."
+      when: not dw_tgt_valid
+
+    # --- clock skew ---------------------------------------------------------
+    - name: Read chrony tracking (preferred clock-sync source)
+      ansible.builtin.command: chronyc tracking
+      register: dw_chrony
+      changed_when: false
+      failed_when: false
+
+    - name: Fall back to timedatectl when chrony is absent
+      ansible.builtin.command: timedatectl show -p NTPSynchronized --value
+      register: dw_timedatectl
+      changed_when: false
+      failed_when: false
+      when: dw_chrony.rc != 0
+
+    - name: Compute clock offset and sync state
+      ansible.builtin.set_fact:
+        # chrony reports e.g. "System time : 0.000123 seconds fast of NTP time"
+        dw_clock_offset_seconds: >-
+          {{ (dw_chrony.stdout | default('') | regex_search('System time\\s*:\\s*([0-9.]+)', '\\1') | first | default('0', true)) | float }}
+        dw_clock_synced: >-
+          {{ (dw_chrony.rc == 0 and ('Leap status     : Normal' in (dw_chrony.stdout | default('')) or 'Not synchronised' not in (dw_chrony.stdout | default(''))))
+             or (dw_timedatectl.stdout | default('') | trim == 'yes') }}
+
+    - name: Record clock health
+      ansible.builtin.set_fact:
+        dw_clock_ok: "{{ (dw_clock_synced | bool) and (dw_clock_offset_seconds | float) < (dw_clock_skew_max_seconds | int) }}"
+
+    - name: Remediation — clock skew / not synchronized
+      ansible.builtin.debug:
+        msg:
+          - "CLOCK IS NOT SYNCED WITHIN {{ dw_clock_skew_max_seconds }}s OF A TIME SOURCE."
+          - "measured offset: {{ dw_clock_offset_seconds }}s   synced: {{ dw_clock_synced }}"
+          - "Remediate: point chrony at the client's DC/NTP and wait for sync:"
+          - "  echo 'server <dc-or-ntp-ip> iburst' | sudo tee /etc/chrony/conf.d/driftwatch.conf"
+          - "  sudo systemctl restart chrony && chronyc makestep && chronyc tracking"
+      when: not dw_clock_ok
+
+- name: Preflight — per-Windows-host transport probe
+  hosts: windows
+  connection: local          # probe FROM the control node; no target credentials needed yet
+  gather_facts: false
+  vars:
+    dw_tgt_valid: "{{ hostvars['localhost'].dw_tgt_valid | default(false) }}"
+    dw_clock_ok: "{{ hostvars['localhost'].dw_clock_ok | default(false) }}"
+    dw_target: "{{ ansible_host | default(inventory_hostname) }}"
+  tasks:
+    - name: DNS — resolve the target FQDN (proves DNS is pointed at the DC)
+      ansible.builtin.command: "getent hosts {{ inventory_hostname }}"
+      register: dw_dns
+      changed_when: false
+      failed_when: false
+
+    - name: Probe WinRM-HTTPS (5986)
+      ansible.builtin.wait_for:
+        host: "{{ dw_target }}"
+        port: 5986
+        timeout: 5
+        state: started
+      register: dw_winrm
+      failed_when: false
+
+    - name: Probe OpenSSH (22)
+      ansible.builtin.wait_for:
+        host: "{{ dw_target }}"
+        port: 22
+        timeout: 5
+        state: started
+      register: dw_ssh
+      failed_when: false
+
+    - name: Classify this host's transport
+      ansible.builtin.set_fact:
+        dw_dns_ok: "{{ dw_dns.rc == 0 }}"
+        dw_winrm_open: "{{ dw_winrm.state | default('') == 'started' }}"
+        dw_ssh_open: "{{ dw_ssh.state | default('') == 'started' }}"
+
+    - name: Select the rung (Kerberos > OpenSSH > NTLM last-resort > unreachable)
+      ansible.builtin.set_fact:
+        dw_transport: >-
+          {{ 'kerberos' if (dw_winrm_open and (dw_tgt_valid | bool) and (dw_clock_ok | bool) and dw_dns_ok)
+             else ('ssh' if dw_ssh_open
+             else ('ntlm' if dw_winrm_open
+             else 'unreachable')) }}
+        dw_transport_note: >-
+          {{ '' if (dw_winrm_open and (dw_tgt_valid | bool) and (dw_clock_ok | bool) and dw_dns_ok)
+             else ('OpenSSH fallback' if dw_ssh_open
+             else ('WinRM reachable but Kerberos prereqs unmet — NTLM is a documented exception only (§3.1); never over HTTP' if dw_winrm_open
+             else 'no viable transport — authorized-but-not-assessed coverage gap (§15.2)')) }}
+
+- name: Preflight — assemble transport matrix and gate the engagement
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dw_win_hosts: "{{ groups['windows'] | default([]) }}"
+  tasks:
+    - name: Build the transport matrix
+      ansible.builtin.set_fact:
+        dw_matrix_hosts: >-
+          {{ dw_matrix_hosts | default({}) | combine({
+               item: {
+                 'transport':        hostvars[item].dw_transport   | default('unreachable'),
+                 'winrm_https_open': hostvars[item].dw_winrm_open  | default(false),
+                 'openssh_open':     hostvars[item].dw_ssh_open    | default(false),
+                 'dns_ok':           hostvars[item].dw_dns_ok      | default(false),
+                 'tgt_valid':        dw_tgt_valid,
+                 'clock_ok':         dw_clock_ok,
+                 'note':             hostvars[item].dw_transport_note | default('not probed')
+               }
+             }) }}
+      loop: "{{ dw_win_hosts }}"
+
+    - name: Write preflight/transport_matrix.json (control node — read-only toward targets)
+      ansible.builtin.copy:
+        dest: "{{ dw_engagement_dir }}/preflight/transport_matrix.json"
+        mode: "0600"
+        content: "{{ {
+            'schema_version': '1.0',
+            'engagement': dw_engagement | default(dw_engagement_dir | basename),
+            'run_id': dw_run_id | default('preflight'),
+            'generated_at': ansible_date_time.iso8601 | default('') if ansible_date_time is defined else '',
+            'kerberos_prereqs': {'tgt_valid': dw_tgt_valid, 'clock_ok': dw_clock_ok,
+                                 'tgt_principal': hostvars['localhost'].dw_tgt_principal | default('(none)')},
+            'hosts': dw_matrix_hosts | default({})
+          } | to_nice_json }}"
+
+    - name: Summarize the matrix
+      ansible.builtin.debug:
+        msg: >-
+          transport matrix: {{ (dw_matrix_hosts | default({})).values() | map(attribute='transport') | list
+                               | community.general.counter | default({}, true) }}
+          (TGT={{ dw_tgt_valid }}, clock_ok={{ dw_clock_ok }})
+
+    - name: Collect hosts with no viable transport
+      ansible.builtin.set_fact:
+        dw_unreachable: >-
+          {{ (dw_matrix_hosts | default({})) | dict2items
+             | selectattr('value.transport', 'equalto', 'unreachable') | map(attribute='key') | list }}
+
+    # Hosts with NO viable transport do NOT fail preflight: they are "authorized but not
+    # assessed" coverage gaps (design §3.1/§15.2) — recorded in the matrix, folded into the
+    # run's no_transport list by the CLI, and emitted as coverage.no_transport findings.
+    # Blocking the whole engagement on them would defeat the point of surfacing them early.
+    - name: Coverage warning — hosts with no viable transport
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ dw_unreachable | length }} Windows host(s) have NO viable transport and
+          will be reported as authorized-but-not-assessed coverage gaps:
+          {{ dw_unreachable | join(', ') }}.
+          Ask the client to enable WinRM-HTTPS or OpenSSH via THEIR GPO/change process —
+          their change, their environment, never a silent modification by this tool (§3.1).
+      when: (dw_unreachable | length) > 0
+
+    # FAIL LOUDLY on the kit-side Kerberos prerequisites: they are fixable right now, and
+    # the default transport rung cannot work without them (design §3.1, Appendix D.3).
+    - name: Gate — Kerberos prerequisites
+      ansible.builtin.assert:
+        that:
+          - dw_tgt_valid | bool
+          - dw_clock_ok | bool
+        fail_msg: |
+          PREFLIGHT FAILED — do not start collection until these are resolved:
+            * TGT valid ................. {{ dw_tgt_valid }}   (kinit <user>@<REALM> on the kit)
+            * clock within 5 min ........ {{ dw_clock_ok }}   (chrony against the client DC/NTP)
+          The transport matrix has already been written for the report/coverage record.
+        success_msg: >-
+          Preflight OK — Kerberos prerequisites satisfied;
+          {{ dw_unreachable | length }} host(s) recorded as no-transport coverage gaps.
+      when: (dw_win_hosts | length) > 0

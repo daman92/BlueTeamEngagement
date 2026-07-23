@@ -1,0 +1,47 @@
+---
+# W8 wmi_subscriptions (CONTRACTS §3.2 `wmi_subscriptions`)
+# identity: kind, name | other: query, destination, consumer_type
+# kind in {filter, consumer, binding}
+#
+# Enumerates root\subscription: __EventFilter, the concrete __EventConsumer subclasses,
+# and __FilterToConsumerBinding (design W8). A non-inventoried subscription is a favoured
+# stealth-persistence artifact.
+
+- name: "W8 WMI event subscriptions"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $ns = 'root\subscription'
+      $out = New-Object System.Collections.ArrayList
+
+      foreach ($f in (Get-CimInstance -Namespace $ns -ClassName __EventFilter -ErrorAction SilentlyContinue)) {
+        [void]$out.Add([ordered]@{ kind = 'filter'; name = $f.Name; query = $f.Query; destination = $null; consumer_type = $null })
+      }
+
+      foreach ($cls in @('CommandLineEventConsumer', 'ActiveScriptEventConsumer', 'LogFileEventConsumer', 'NTEventLogEventConsumer', 'SMTPEventConsumer')) {
+        foreach ($c in (Get-CimInstance -Namespace $ns -ClassName $cls -ErrorAction SilentlyContinue)) {
+          $dest = $null
+          if ($c.PSObject.Properties['CommandLineTemplate'] -and $c.CommandLineTemplate) { $dest = $c.CommandLineTemplate }
+          elseif ($c.PSObject.Properties['ExecutablePath'] -and $c.ExecutablePath)        { $dest = $c.ExecutablePath }
+          elseif ($c.PSObject.Properties['ScriptFileName'] -and $c.ScriptFileName)        { $dest = $c.ScriptFileName }
+          elseif ($c.PSObject.Properties['ScriptText'] -and $c.ScriptText)                { $dest = $c.ScriptText }
+          [void]$out.Add([ordered]@{ kind = 'consumer'; name = $c.Name; query = $null; destination = $dest; consumer_type = "$($c.CimClass.CimClassName)" })
+        }
+      }
+
+      foreach ($b in (Get-CimInstance -Namespace $ns -ClassName __FilterToConsumerBinding -ErrorAction SilentlyContinue)) {
+        $fn = "$($b.Filter)"; $cn = "$($b.Consumer)"
+        [void]$out.Add([ordered]@{ kind = 'binding'; name = "$fn=>$cn"; query = $null; destination = $cn; consumer_type = $null })
+      }
+      $out
+  register: reg_wmi_subscriptions
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record wmi_subscriptions collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['wmi_subscriptions'] }}"
+  when: reg_wmi_subscriptions is failed

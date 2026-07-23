@@ -1,0 +1,25 @@
+---
+# Defaults for the read-only Windows snapshot collector (design §4.2, CONTRACTS §3.2).
+# All of these are normally supplied by the CLI via -e or by inventory group_vars;
+# the values here are safe fallbacks so the role is runnable/lintable in isolation.
+
+# Engagement identity and paths (CONTRACTS §1.5).
+dw_engagement: "unset-engagement"
+dw_engagement_dir: "/opt/driftwatch/engagements/{{ dw_engagement }}"
+dw_run_id: "{{ now(utc=true).strftime('%Y-%m-%dT%H%MZ') }}"
+dw_snapshot_dir: "{{ dw_engagement_dir }}/snapshots"
+
+# Collection knobs.
+dw_deep: false                 # gate expensive work (full hashing, driver hashing)
+dw_hash_policy: "tiered"        # full | tiered | servers_only  (CONTRACTS §1.4 settings.hash_policy)
+
+# Transport recorded in meta.transport (windows only: kerberos|ssh|ntlm).
+# Derived from the effective connection; override with -e dw_transport=ntlm for the
+# documented last-resort exception (design §3.1).
+dw_transport: >-
+  {{ 'ssh'
+     if (ansible_connection | default('winrm')) in ['ssh', 'psrp']
+     else (ansible_winrm_transport | default('kerberos')) }}
+
+# Upper bound on how many 1102/104 log-clear events to enumerate per log (audit_logging).
+dw_event_scan_max: 50

@@ -1,0 +1,47 @@
+---
+# tasks/ssh_config.yml — L9b sshd effective config (CONTRACTS §3.1 `ssh_config`)
+# object category — fields: file_hash, permit_root_login, password_authentication,
+#                           effective (dict of the `sshd -T` subset)
+#
+# sshd_config file hash + the effective (post-default, post-include) settings from
+# `sshd -T`, restricted to the subset in dw_snapshot_linux_sshd_t_keys. Root login
+# or password auth flipping on is a Critical policy signal (design L9). Records:
+#   hash | <sha256 of /etc/ssh/sshd_config>
+#   eff  | <key> | <value>          (repeated keys are comma-joined by the template)
+
+- name: L9b collect sshd effective configuration (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    if [ -f /etc/ssh/sshd_config ]; then
+      printf '%s\n' "hash$US$(sha256sum /etc/ssh/sshd_config 2>/dev/null | awk '{print $1}')"
+    fi
+    SSHD=$(command -v sshd 2>/dev/null || true)
+    if [ -z "$SSHD" ] && [ -x /usr/sbin/sshd ]; then SSHD=/usr/sbin/sshd; fi
+    if [ -n "$SSHD" ]; then
+      "$SSHD" -T 2>/dev/null | while IFS= read -r sl; do
+        k=$(printf '%s' "$sl" | awk '{print $1}')
+        v=$(printf '%s' "$sl" | awk '{ $1=""; sub(/^ +/,""); print }')
+        case " {{ dw_snapshot_linux_sshd_t_keys | join(' ') }} " in
+          *" $k "*) printf '%s\n' "eff$US$k$US$v" ;;
+        esac
+      done
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_sshcfg
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L9b stash sshd config records
+  ansible.builtin.set_fact:
+    dw_raw_ssh_config: "{{ dw_sshcfg.stdout | default('') }}"
+
+- name: L9b mark ssh_config failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['ssh_config'] }}"
+  when: (dw_sshcfg.rc | default(1)) != 0

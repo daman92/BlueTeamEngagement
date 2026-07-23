@@ -1,0 +1,30 @@
+[Unit]
+Description=driftwatch network-device collection (config text + structured facts, all tiers)
+Documentation=file:///opt/driftwatch/systemd/README.md
+ConditionPathExists=/etc/driftwatch/engagement.env
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=driftwatch
+Group=driftwatch
+WorkingDirectory=/opt/driftwatch
+EnvironmentFile=/etc/driftwatch/engagement.env
+# --limit network runs only the network group. Configs are tiny, so this can run often; the
+# collect verb still runs diff + report afterward. (design §4.3 / §8)
+ExecStart=/opt/driftwatch/bin/driftwatch collect --limit network
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3600
+
+# --- hardening -------------------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/opt/driftwatch/engagements
+
+[Install]
+WantedBy=multi-user.target

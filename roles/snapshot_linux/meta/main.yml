@@ -1,0 +1,36 @@
+---
+# roles/snapshot_linux/meta/main.yml
+galaxy_info:
+  role_name: snapshot_linux
+  namespace: driftwatch
+  author: driftwatch
+  description: >-
+    Read-only point-in-time security snapshot collector for Linux hosts
+    (driftwatch design §4.1, categories L1–L17). Collects processes, persistence,
+    users/groups, network exposure, integrity and logging-health facts and
+    assembles them into one canonical JSON document on the control node. Makes NO
+    changes to targets (enforced by scripts/lint_readonly.py).
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "8"
+        - "9"
+    - name: Fedora
+      versions:
+        - all
+    - name: Debian
+      versions:
+        - all
+    - name: Ubuntu
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - blueteam
+    - audit
+    - driftwatch
+    - readonly
+
+dependencies: []

@@ -1,0 +1,98 @@
+---
+# tasks/cron.yml — L5 cron & at jobs (CONTRACTS §3.1 `cron`)
+# identity: source, user, schedule, command | other: file_hash
+#
+# Sources: per-user crontabs (crontab -l -u <user> for every passwd entry),
+# /etc/crontab, /etc/cron.d/*, the cron.{hourly,daily,weekly,monthly} script
+# inventory (schedule @<period>, file_hash per script), and pending at(1) jobs.
+# Emits US(0x1F)-delimited records:  source | user | schedule | file_hash | command
+# (command last — it is the only free-text field, so an embedded delimiter cannot
+# shift the other columns). The template maps them to the §3.1 field set.
+
+- name: L5 collect cron and at jobs (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+
+    # -- per-user crontabs ---------------------------------------------------
+    getent passwd | cut -d: -f1 | while IFS= read -r u; do
+      ct=$(crontab -l -u "$u" 2>/dev/null) || continue
+      [ -n "$ct" ] || continue
+      fh=$(printf '%s\n' "$ct" | sha256sum | awk '{print $1}')
+      printf '%s\n' "$ct" | awk -v US="$US" -v u="$u" -v fh="$fh" '
+        {
+          line=$0; sub(/^[[:space:]]+/,"",line); gsub(/[[:space:]]+/," ",line)
+          if (line == "" || line ~ /^#/) next
+          if (line ~ /^[A-Za-z_][A-Za-z0-9_]* *=/) next
+          if (line ~ /^@/) {
+            sched=line; sub(/ .*/,"",sched)
+            cmd=line; sub(/^[^ ]+ /,"",cmd)
+          } else {
+            n=split(line,a," "); if (n < 6) next
+            sched=a[1]" "a[2]" "a[3]" "a[4]" "a[5]
+            cmd=line; for (i=1;i<=5;i++) sub(/^[^ ]+ /,"",cmd)
+          }
+          print "user_crontab" US u US sched US fh US cmd
+        }'
+    done
+
+    # -- system crontab + /etc/cron.d (6-field format with a user column) ----
+    for cf in /etc/crontab /etc/cron.d/*; do
+      [ -f "$cf" ] || continue
+      fh=$(sha256sum "$cf" 2>/dev/null | awk '{print $1}')
+      awk -v US="$US" -v src="$cf" -v fh="$fh" '
+        {
+          line=$0; sub(/^[[:space:]]+/,"",line); gsub(/[[:space:]]+/," ",line)
+          if (line == "" || line ~ /^#/) next
+          if (line ~ /^[A-Za-z_][A-Za-z0-9_]* *=/) next
+          if (line ~ /^@/) {
+            n=split(line,a," "); if (n < 3) next
+            sched=a[1]; usr=a[2]
+            cmd=line; sub(/^[^ ]+ [^ ]+ /,"",cmd)
+          } else {
+            n=split(line,a," "); if (n < 7) next
+            sched=a[1]" "a[2]" "a[3]" "a[4]" "a[5]; usr=a[6]
+            cmd=line; for (i=1;i<=6;i++) sub(/^[^ ]+ /,"",cmd)
+          }
+          print src US usr US sched US fh US cmd
+        }' "$cf"
+    done
+
+    # -- periodic script directories (run-parts inventory, hashed) -----------
+    for d in hourly daily weekly monthly; do
+      for f in /etc/cron.$d/*; do
+        [ -f "$f" ] || continue
+        fh=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+        printf '%s\n' "/etc/cron.$d${US}root$US@$d$US$fh$US$f"
+      done
+    done
+
+    # -- pending at(1) jobs (one-shot; content hash makes changes visible) ---
+    if command -v atq >/dev/null 2>&1; then
+      atq 2>/dev/null | while IFS= read -r aj; do
+        id=$(printf '%s' "$aj" | awk '{print $1}')
+        [ -n "$id" ] || continue
+        au=$(printf '%s' "$aj" | awk '{print $NF}')
+        asched=$(printf '%s' "$aj" | awk '{s=""; for(i=2;i<=NF-2;i++) s=s (i>2?" ":"") $i; print s}')
+        ah=$(at -c "$id" 2>/dev/null | sha256sum | awk '{print $1}')
+        printf '%s\n' "at$US$au$US$asched$US$ah${US}at-job"
+      done
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_cron
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L5 stash cron records
+  ansible.builtin.set_fact:
+    dw_raw_cron: "{{ dw_cron.stdout | default('') }}"
+
+- name: L5 mark cron failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['cron'] }}"
+  when: (dw_cron.rc | default(1)) != 0

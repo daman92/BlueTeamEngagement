@@ -1,0 +1,105 @@
+---
+# W1 processes (CONTRACTS §3.2 `processes`)
+# identity: path, sha256, owner, cmdline_norm | volatile: pid, ppid, started
+# other:    name, cmdline, signed, signer, user_writable_path (bool)
+#
+# Hashing (Get-FileHash) is the expensive step, so it is tiered (design C.2): the
+# "interesting" subset (unsigned or running from a user-writable path) is ALWAYS hashed
+# because that is exactly where payloads live; the full set is hashed only when the
+# hash_policy / deep-run gate says so. Authenticode signing is cheap (no full read) and is
+# always collected. Both are cached per on-disk path to avoid re-work within the host.
+
+- name: "W1 processes"
+  ansible.windows.win_powershell:
+    depth: 5
+    parameters:
+      HashPolicy: "{{ dw_hash_policy }}"
+      Deep: "{{ dw_deep | bool | ternary('true', 'false') }}"
+      IsServer: "{{ (('win_servers' in group_names) or ('crown_jewels' in group_names)) | ternary('true', 'false') }}"
+    script: |
+      param(
+        [string]$HashPolicy = 'tiered',
+        [string]$Deep = 'false',
+        [string]$IsServer = 'false'
+      )
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $deep = $Deep -eq 'true'
+      $isServer = $IsServer -eq 'true'
+      $hashAll = ($HashPolicy -eq 'full') -or
+                 (($HashPolicy -eq 'servers_only') -and $isServer) -or
+                 (($HashPolicy -eq 'tiered') -and $deep)
+
+      $userWritable = @('*\Users\*', '*\AppData\*', '*\Temp\*', '*\ProgramData\*', '*\Public\*')
+      $sigCache = @{}
+      $hashCache = @{}
+
+      function Get-Sig([string]$p) {
+        if ($sigCache.ContainsKey($p)) { return $sigCache[$p] }
+        $r = [ordered]@{ signed = $false; signer = $null }
+        try {
+          $s = Get-AuthenticodeSignature -LiteralPath $p -ErrorAction Stop
+          $r.signed = ($s.Status -eq 'Valid')
+          if ($s.SignerCertificate) { $r.signer = $s.SignerCertificate.Subject }
+        } catch {}
+        $sigCache[$p] = $r
+        return $r
+      }
+      function Get-Sha([string]$p) {
+        if ($hashCache.ContainsKey($p)) { return $hashCache[$p] }
+        $h = $null
+        try { $h = (Get-FileHash -LiteralPath $p -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+        $hashCache[$p] = $h
+        return $h
+      }
+
+      $procs = Get-CimInstance -ClassName Win32_Process -ErrorAction Stop
+      $out = foreach ($p in $procs) {
+        $path = $p.ExecutablePath
+        $cmd  = $p.CommandLine
+
+        $owner = $null
+        try {
+          $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+          if ($o -and $o.User) { $owner = if ($o.Domain) { "$($o.Domain)\$($o.User)" } else { $o.User } }
+        } catch {}
+
+        $uw = $false
+        if ($path) { foreach ($pat in $userWritable) { if ($path -like $pat) { $uw = $true; break } } }
+
+        $signed = $false; $signer = $null; $sha = $null
+        if ($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) {
+          $sg = Get-Sig $path
+          $signed = $sg.signed; $signer = $sg.signer
+          if ($hashAll -or (-not $signed) -or $uw) { $sha = Get-Sha $path }
+        }
+
+        $cmdNorm = if ($cmd) { ($cmd -replace '\s+', ' ').Trim() } else { '' }
+        $started = $null
+        if ($p.CreationDate) { $started = $p.CreationDate.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+
+        [ordered]@{
+          path               = $path
+          sha256             = $sha
+          owner              = $owner
+          cmdline_norm       = $cmdNorm
+          pid                = [int]$p.ProcessId
+          ppid               = [int]$p.ParentProcessId
+          started            = $started
+          name               = $p.Name
+          cmdline            = $cmd
+          signed             = [bool]$signed
+          signer             = $signer
+          user_writable_path = [bool]$uw
+        }
+      }
+      $out
+  register: reg_processes
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record processes collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['processes'] }}"
+  when: reg_processes is failed

@@ -1,0 +1,38 @@
+# driftwatch — group_vars for the `network` group (design §3, §4.3)
+# =============================================================================
+# Transport: SSH via ansible.netcommon.network_cli. `ansible_network_os` is set
+# per sub-group / per host (it must match the device platform), so it is NOT set
+# here — a wrong network_os breaks collection. The role degrades gracefully
+# across three tiers (T1 vendor modules -> T2 command pack -> T3 generic config
+# text), recording the tier used in meta.collection_tier (design §4.3).
+#
+# Privilege: a read-only role / RBAC level where the platform supports it
+# (IOS priv with command authorization, JunOS read-only class, PAN-OS
+# superuser-read-only). Credentials come from the engagement vault by name.
+# =============================================================================
+
+dw_platform: network
+
+# --- connection --------------------------------------------------------------
+ansible_connection: ansible.netcommon.network_cli
+ansible_user: "{{ vault_network_user | default('') }}"
+# ansible_password: "{{ vault_network_password }}"
+# ansible_ssh_private_key_file: "{{ dw_engagement_dir }}/vault/network_id"
+
+# ansible_network_os is REQUIRED and platform-specific — set it on the sub-group
+# or host, e.g.:
+#   ios_switches / ios_routers : cisco.ios.ios
+#   eos_switches               : arista.eos.eos
+#   junos_routers              : junipernetworks.junos.junos
+#   asa                        : cisco.asa.asa
+#   fortios                    : fortinet.fortios.fortios
+#   panos                      : paloaltonetworks.panos.panos
+
+# --- privileged exec where needed for read-only `show` commands --------------
+# Many platforms need enable/priv for a subset of show output; keep it read-only.
+ansible_become: true
+ansible_become_method: enable
+# ansible_become_password: "{{ vault_network_enable_password }}"
+
+# Network devices are slower and chattier over the CLI; allow a longer ceiling.
+ansible_command_timeout: 120

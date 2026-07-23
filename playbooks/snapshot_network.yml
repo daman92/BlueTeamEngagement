@@ -1,0 +1,27 @@
+---
+# snapshot_network.yml — network-device collection (design §4.3).
+#
+# The role is built in three tiers (T1 vendor modules / T2 command-pack / T3 generic
+# fallback) and records the tier used in meta.collection_tier; config-text diff is the
+# universal backstop so an unknown vendor never yields an empty snapshot. Sanitized config
+# text and structured facts are assembled on the control node (delegate_to: localhost).
+#
+# Connection is intentionally NOT set at play level: network_cli suits IOS/NX-OS/EOS/JunOS,
+# but API-only appliances (PAN-OS, some FortiOS) use httpapi. Each host/group declares its
+# own ansible_connection + ansible_network_os in the engagement inventory group_vars; the
+# role degrades gracefully when they are absent (fingerprint from banner, else T3 ladder).
+#
+# Configs are tiny, so diffing often is cheap (§8). Extra vars come from bin/driftwatch.
+
+- name: Network device snapshots (§4.3 / role snapshot_network)
+  hosts: network
+  gather_facts: false
+  # Config pulls are light, but batching keeps the number of concurrent CLI sessions to a
+  # switch/router/firewall control plane modest.
+  serial: "25%"
+  any_errors_fatal: false
+  max_fail_percentage: 100
+  strategy: linear
+  roles:
+    - role: snapshot_network
+  tags: [snapshot, network]

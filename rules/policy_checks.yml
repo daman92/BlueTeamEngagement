@@ -1,0 +1,462 @@
+# driftwatch — baseline-free policy checks (design §6 mode 4; CONTRACTS.md §5.1 DSL)
+# =============================================================================
+# These rules fire on FIRST CONTACT — they need no baseline and no prior run.
+# In the portable per-engagement model you often arrive with little/no history,
+# so policy checks and the fleet-outlier lens carry the load (design §15.1).
+#
+# Match DSL (implemented in scripts/diff_engine.py, do NOT re-invent):
+#   match:
+#     all: [ {field, op, value}, ... ]   # AND — every condition must hold
+#     any: [ {field, op, value}, ... ]   # OR  — at least one (both keys may co-exist)
+#   ops: eq ne regex(search) in not_in gt lt exists absent contains
+#   `field` is a dot-path into the item (array categories) or the object dict
+#   (object categories). Array rules fire once PER MATCHING ITEM; object rules
+#   fire once if the whole object matches.
+#
+# Each policy delta carries lens=policy, change_type from the rule (default
+# `added` — the flagged thing is present), and this rule's `id` as the rule.
+# It then MERGES BY FINGERPRINT with any drift delta for the same item, so a
+# first-appearance shows comparison: ["temporal","policy"] and the policy rule
+# wins as the reported `rule`. (Fingerprint = platform|category|change_type|
+# canonical(detail.identity); it excludes the rule and the lens — CONTRACTS §4.)
+#
+# NOTE ON OBJECT-CATEGORY RULES (ssh_config, security_posture, audit_logging,
+# software_image, ad_krbtgt, kernel_state): every object rule for the same
+# category emits identity {"key": "<category>"}. Multiple such rules therefore
+# share a fingerprint and merge into ONE finding at the highest matching
+# severity, with every rule's description accumulated in detail.note. This is
+# the engine's documented behaviour, not a bug — treat it as "one posture
+# finding, several reasons".
+#
+# NOISE / ALLOWLIST MODEL: several rules below (root CAs, VPN peers, SPAN
+# sessions, inbound NAT, privileged-group membership, ...) enumerate items that
+# are legitimately present on some hosts. That is intentional: on run 1 you WANT
+# the full review list. The analyst confirms the known-good ones and suppresses
+# them with an EXPIRING allowlist entry (allowlists/*.yml, CONTRACTS §5.3) — the
+# allowlist is the running inventory. Thereafter only genuinely-new items surface
+# (drift), and the policy rule upgrades their severity when they do.
+#
+# Values that YAML 1.1 would coerce to booleans ("yes"/"no"/"on"/"off") are
+# quoted; real booleans (true/false) and integers are left bare so they compare
+# against boolean/int snapshot fields correctly.
+# =============================================================================
+
+rules:
+
+  # ------------------------------------------------------------------ linux ---
+
+  - id: policy.linux.ld_so_preload_present
+    platform: linux
+    category: persistence
+    severity: critical
+    description: "/etc/ld.so.preload exists — every dynamically linked binary loads it; near-universal rootkit surface (design L7)"
+    match:
+      all:
+        - {field: mechanism, op: eq, value: ld_so_preload}
+        - {field: present, op: eq, value: true}
+
+  - id: policy.linux.ld_preload_env_set
+    platform: linux
+    category: persistence
+    severity: high
+    description: "LD_PRELOAD injected via a unit/environment file — library-injection persistence (design L7)"
+    match:
+      all:
+        - {field: mechanism, op: eq, value: ld_preload_env}
+        - {field: present, op: eq, value: true}
+
+  - id: policy.linux.extra_uid0_account
+    platform: linux
+    category: users
+    severity: critical
+    description: "Non-root account with UID 0 — a second superuser identity (design L8, Appendix A Critical)"
+    match:
+      all:
+        - {field: uid, op: eq, value: 0}
+        - {field: name, op: ne, value: root}
+
+  - id: policy.linux.suid_in_user_writable_path
+    platform: linux
+    category: file_integrity
+    severity: critical
+    description: "SUID binary in a user-writable / non-standard path (/tmp, /home, /dev/shm, /var/tmp, /run, /mnt, /media) — classic privesc drop (design L13)"
+    # A brand-new SUID binary in a *standard* path is caught baseline-relative by
+    # drift.linux.file_integrity (added). This rule catches the always-suspicious
+    # case that needs no baseline: a SUID bit on a binary outside system dirs.
+    match:
+      all:
+        - {field: kind, op: eq, value: suid}
+        - {field: path, op: regex, value: '^/(tmp|var/tmp|dev/shm|home|run|mnt|media)/'}
+
+  - id: policy.linux.kernel_module_no_backing_file
+    platform: linux
+    category: kernel_modules
+    severity: critical
+    description: "Loaded kernel module with no on-disk file hash — injected/out-of-tree module, rootkit surface (design L11)"
+    # The v1 kernel_modules schema has no `signed` field, so unsigned-ness proper
+    # is not directly expressible (see return notes). A loaded module the collector
+    # could not hash to a backing .ko is the strongest baseline-free proxy.
+    # `any` covers both emission conventions: key omitted entirely, or key present
+    # with a null/empty value.
+    match:
+      any:
+        - {field: sha256, op: absent}
+        - {field: sha256, op: eq, value: null}
+        - {field: sha256, op: eq, value: ''}
+
+  - id: policy.linux.kernel_tainted
+    platform: linux
+    category: kernel_state
+    severity: high
+    description: "Kernel taint flag set — an out-of-tree or unsigned module was loaded (design L11)"
+    # Object rule: matches the kernel_state dict. /proc/sys/kernel/tainted is a
+    # BITMASK (incl. O=out-of-tree, E=unsigned-module); any non-zero value means
+    # tainted. `gt 0` fires for both an integer bitmask and a boolean true
+    # (true > 0 in the engine); the regex arm covers a string-typed digit value.
+    # Some fleets run legitimately tainted (proprietary GPU drivers); pair with
+    # review/allowlist.
+    match:
+      any:
+        - {field: tainted, op: gt, value: 0}
+        - {field: tainted, op: regex, value: '^[1-9][0-9]*$'}
+
+  - id: policy.linux.ssh_root_login_enabled
+    platform: linux
+    category: ssh_config
+    severity: critical
+    description: "sshd PermitRootLogin yes — direct remote root logon permitted (design L9)"
+    # Object rule (ssh_config). PermitRootLogin prohibit-password/without-password
+    # (key-only root) is a common hardened default and deliberately NOT matched;
+    # only the fully-open `yes` is flagged.
+    match:
+      all:
+        - {field: permit_root_login, op: eq, value: "yes"}
+
+  - id: policy.linux.ssh_password_auth_enabled
+    platform: linux
+    category: ssh_config
+    severity: high
+    description: "sshd PasswordAuthentication yes — password logon exposes accounts to guessing/spray (design L9)"
+    # High rather than critical: password auth is a common default. The dangerous
+    # event is it being flipped ON, which drift.linux.ssh_config (changed) catches.
+    match:
+      all:
+        - {field: password_authentication, op: eq, value: "yes"}
+
+  - id: policy.linux.fileless_execution
+    platform: linux
+    category: fileless
+    severity: critical
+    description: "Process running from a deleted binary, memfd, or anonymous executable mapping — fileless execution (design L2, Appendix A Critical)"
+    match:
+      all:
+        - {field: indicator, op: in, value: [deleted_exe, memfd, anon_exec_map]}
+
+  - id: policy.linux.new_root_ca
+    platform: linux
+    category: dns_trust
+    severity: critical
+    description: "CA certificate present in the system trust store — TLS-interception surface if unexpected (design L15, Appendix A Critical)"
+    # Pairs with drift: a genuinely NEW CA merges the temporal `added` delta here.
+    # Pre-existing trusted CAs are confirmed once and allowlisted.
+    match:
+      all:
+        - {field: kind, op: eq, value: ca_cert}
+
+  - id: policy.linux.hosts_file_domain_override
+    platform: linux
+    category: dns_trust
+    severity: critical
+    description: "/etc/hosts maps a real domain to a non-loopback IP — DNS override / traffic redirect (design L15, Appendix A Critical)"
+    # Loopback / all-zero mappings (localhost, *.localdomain -> 127.0.0.1) are
+    # excluded so ordinary hosts files do not fire.
+    match:
+      all:
+        - {field: kind, op: eq, value: hosts_entry}
+        - {field: key, op: regex, value: '\.[A-Za-z]{2,}$'}
+        - {field: value, op: not_in, value: ['127.0.0.1', '127.0.1.1', '::1', '0.0.0.0', 'fe00::0', 'ff00::0', 'ff02::1', 'ff02::2', 'ff02::3']}
+
+  # ----------------------------------------------------------------- windows ---
+
+  - id: policy.windows.new_trusted_root_ca
+    platform: windows
+    category: dns_trust
+    severity: critical
+    description: "New certificate in LocalMachine\\Root — trusts an arbitrary CA fleet-wide, enabling TLS interception (design W13, Appendix A Critical)"
+    match:
+      all:
+        - {field: kind, op: eq, value: root_cert}
+
+  - id: policy.windows.new_intermediate_ca
+    platform: windows
+    category: dns_trust
+    severity: high
+    description: "New certificate in the intermediate CA store — interception-capable when chained to a trusted root (design W13)"
+    match:
+      all:
+        - {field: kind, op: eq, value: ca_cert}
+
+  - id: policy.windows.hosts_file_domain_override
+    platform: windows
+    category: dns_trust
+    severity: critical
+    description: "hosts file maps a real domain to a non-loopback IP — DNS override / traffic redirect (design W13)"
+    match:
+      all:
+        - {field: kind, op: eq, value: hosts_entry}
+        - {field: key, op: regex, value: '\.[A-Za-z]{2,}$'}
+        - {field: value, op: not_in, value: ['127.0.0.1', '::1', '0.0.0.0']}
+
+  - id: policy.windows.ifeo_lsa_autorun
+    platform: windows
+    category: autoruns
+    severity: critical
+    description: "Autorun under Image File Execution Options (debugger hijack) or Control\\Lsa (security/auth package) — stealth persistence (design W7, Appendix A Critical)"
+    # Ordinary Run/RunOnce/Startup autoruns are High and caught by
+    # drift.windows.autoruns (added) via the severity map; only the IFEO/LSA
+    # locations are upgraded to Critical here.
+    match:
+      any:
+        - {field: location, op: regex, value: 'Image File Execution Options'}
+        - {field: location, op: regex, value: '\\Control\\Lsa'}
+
+  - id: policy.windows.wmi_subscription
+    platform: windows
+    category: wmi_subscriptions
+    severity: critical
+    description: "WMI event subscription (filter/consumer/binding) in root\\subscription — favoured stealth persistence, rare on clean hosts (design W8, Appendix A Critical)"
+    match:
+      all:
+        - {field: kind, op: in, value: [filter, consumer, binding]}
+
+  - id: policy.windows.unsigned_driver
+    platform: windows
+    category: drivers
+    severity: critical
+    description: "Loaded kernel driver with no valid Authenticode signature — BYOVD / rootkit surface (design W10, Appendix A Critical)"
+    match:
+      all:
+        - {field: signed, op: eq, value: false}
+
+  - id: policy.windows.defender_exclusion_present
+    platform: windows
+    category: security_posture
+    severity: high
+    description: "Microsoft Defender exclusion configured — a blind spot attackers deliberately create; confirm every path/process/extension (design W17)"
+    # Object rule. `ne []` fires when the sorted exclusion list is non-empty.
+    # The specific exclusion that was ADDED is shown by drift.windows.security_posture (changed).
+    match:
+      all:
+        - {field: defender_exclusions, op: ne, value: []}
+
+  - id: policy.windows.defender_disabled
+    platform: windows
+    category: security_posture
+    severity: critical
+    description: "Microsoft Defender real-time protection is OFF — primary endpoint control disabled (design W17)"
+    match:
+      all:
+        - {field: defender_enabled, op: eq, value: false}
+
+  - id: policy.windows.wdigest_credential_caching
+    platform: windows
+    category: security_posture
+    severity: high
+    description: "WDigest UseLogonCredential enabled — forces cleartext credentials into LSASS memory for harvesting (design W17)"
+    match:
+      all:
+        - {field: wdigest_uselogoncredential, op: eq, value: true}
+
+  - id: policy.windows.audit_log_cleared
+    platform: windows
+    category: audit_logging
+    severity: critical
+    description: "Security/System event log was cleared (event 1102/104) since the last snapshot — anti-forensics (design W14, Appendix A Critical)"
+    # Object rule. cleared_events is a list of {event_id, time}; non-empty => fired.
+    match:
+      all:
+        - {field: cleared_events, op: ne, value: []}
+
+  - id: policy.windows.unsigned_binary_user_writable_path
+    platform: windows
+    category: processes
+    severity: high
+    description: "Unsigned process image running from a user-writable path (%TEMP%, %APPDATA%, C:\\Users\\*) — hallmark of dropped malware (design W1)"
+    match:
+      all:
+        - {field: signed, op: eq, value: false}
+        - {field: user_writable_path, op: eq, value: true}
+
+  - id: policy.windows.fileless_indicator
+    platform: windows
+    category: fileless
+    severity: high
+    description: "Fileless indicator — null image path, name/path mismatch, LOLBin command line, or encoded PowerShell (design W2)"
+    match:
+      all:
+        - {field: indicator, op: in, value: [null_path, name_path_mismatch, lolbin_cmdline, encoded_powershell]}
+
+  - id: policy.windows.new_local_admin
+    platform: windows
+    category: local_groups
+    severity: critical
+    description: "Member of the local Administrators group — enumerate and confirm; a new local admin is a classic lateral-movement artifact (design W9, Appendix A Critical)"
+    # Baseline-free enumeration: built-in/known members (RID-500, Domain Admins)
+    # are confirmed once and allowlisted; genuinely new members surface via drift.
+    match:
+      all:
+        - {field: group, op: regex, value: '(?i)Administrators$'}
+
+  # ----------------------------------------------------------------- network ---
+
+  - id: policy.network.telnet_or_http_mgmt_enabled
+    platform: network
+    category: mgmt_services
+    severity: critical
+    description: "Cleartext management plane enabled (telnet or HTTP server) — credential exposure on the wire (design N5, Appendix A Critical)"
+    match:
+      all:
+        - {field: service, op: in, value: [telnet, http]}
+        - {field: enabled, op: eq, value: true}
+
+  - id: policy.network.uninventoried_mirror_session
+    platform: network
+    category: mirror_sessions
+    severity: critical
+    description: "SPAN/RSPAN/ERSPAN monitor session present — someone is copying traffic; confirm against the mirroring inventory (design N8, Appendix A Critical)"
+    # Every session is surfaced on first contact; inventoried sessions are allowlisted.
+    match:
+      all:
+        - {field: session_id, op: exists}
+
+  - id: policy.network.inbound_nat_rule
+    platform: network
+    category: nat_rules
+    severity: critical
+    description: "Inbound NAT / port-forward to an internal host — exposes an internal service to untrusted networks (design N11, Appendix A Critical)"
+    # `any` covers the emission conventions across tiers: T2/T3 packs that set a
+    # literal direction=inbound, and the T1 IOS parser, which records the raw
+    # `ip nat ... static ...` line in rule_text with direction=inside/outside —
+    # a STATIC nat entry (1:1 or port-forward) is exactly the inbound exposure
+    # this rule is about; dynamic `source list ... overload` PAT is not matched.
+    match:
+      any:
+        - {field: direction, op: eq, value: inbound}
+        - {field: rule_text, op: regex, value: '(?i)\bstatic\b'}
+
+  - id: policy.network.vpn_peer
+    platform: network
+    category: vpn_peers
+    severity: critical
+    description: "VPN peer configured — a tunnel endpoint into the environment; confirm every peer against the VPN inventory (design N11, Appendix A Critical)"
+    match:
+      all:
+        - {field: peer, op: exists}
+
+  - id: policy.network.rogue_tunnel
+    platform: network
+    category: tunnels
+    severity: critical
+    description: "Tunnel interface (GRE/IPIP/VXLAN/...) present — potential covert channel or traffic redirect; confirm against the network design (design N7, Appendix A Critical)"
+    match:
+      all:
+        - {field: name, op: exists}
+
+  - id: policy.network.image_hash_mismatch
+    platform: network
+    category: software_image
+    severity: critical
+    description: "Running OS image hash does not verify against the expected value — possible implanted firmware (design N12, Appendix A Critical)"
+    # Object rule (software_image). hash_verified=false alone means "not checked"
+    # on platforms where the collector cannot run `verify` (the T1 IOS role emits
+    # image_hash: "" + hash_verified: false honestly) — that is a coverage note,
+    # not a mismatch. Only fire when a hash WAS computed and still failed to
+    # verify: image_hash must look like an actual hex digest.
+    match:
+      all:
+        - {field: hash_verified, op: eq, value: false}
+        - {field: image_hash, op: regex, value: '^[0-9a-fA-F]{8,}$'}
+
+  - id: policy.network.snmp_rw_community
+    platform: network
+    category: snmp
+    severity: critical
+    description: "SNMP community with read-write access — full device control via SNMP set (design N5, Appendix A Critical: new RW community)"
+    # Case-insensitive: the T1 IOS parser emits the config's literal `RO`/`RW`
+    # (uppercase); T2 packs may emit lowercase. A bare `eq rw` would silently
+    # never fire on IOS.
+    match:
+      all:
+        - {field: kind, op: eq, value: community}
+        - {field: access, op: regex, value: '(?i)^rw$'}
+
+  # AAA server changed (design N4 / Appendix A Critical) is a CHANGE, not a
+  # first-contact condition, so it has no baseline-free signal expressible in this
+  # DSL — it is caught by drift.network.aaa (changed). The severity map raises
+  # network/aaa/changed to high; treat a changed TACACS/RADIUS server or method
+  # list as Critical in triage per the design.
+
+  # -------------------------------------------------------------------- ad -----
+
+  - id: policy.ad.new_domain_admin
+    platform: ad
+    category: ad_privileged_groups
+    severity: critical
+    description: "Member of Domain Admins / Enterprise Admins / Schema Admins / builtin Administrators — tier-0 control of the domain (design W18, Appendix A Critical)"
+    # Full nested membership is enumerated on first contact for review; confirmed
+    # admins are allowlisted, so later runs surface only genuinely new members.
+    match:
+      all:
+        - {field: group, op: regex, value: '(?i)(Domain Admins|Enterprise Admins|Schema Admins|Administrators)'}
+
+  - id: policy.ad.new_privileged_group_member
+    platform: ad
+    category: ad_privileged_groups
+    severity: high
+    description: "Member of a second-tier privileged group (Account/Backup/Server/Print Operators, DnsAdmins, GPO Creator Owners, Cert Publishers) — grants a path to domain compromise (design W18)"
+    match:
+      all:
+        - {field: group, op: regex, value: '(?i)(Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Cert Publishers)'}
+
+  - id: policy.ad.dcsync_right
+    platform: ad
+    category: ad_dcsync
+    severity: critical
+    description: "Principal holds DS-Replication-Get-Changes-All (DCSync) — can replicate all domain secrets incl. krbtgt (design W18, Appendix A Critical)"
+    # Built-in replication principals (Domain Controllers, Administrators) hold
+    # this legitimately and are allowlisted after review.
+    match:
+      all:
+        - {field: rights, op: contains, value: 'DS-Replication-Get-Changes-All'}
+
+  - id: policy.ad.unconstrained_delegation
+    platform: ad
+    category: ad_delegation
+    severity: critical
+    description: "Account trusted for unconstrained delegation — can impersonate any user that authenticates to it, incl. DAs (design W18, Appendix A Critical)"
+    # DCs hold this legitimately; allowlist them after review.
+    match:
+      all:
+        - {field: kind, op: eq, value: unconstrained}
+
+  - id: policy.ad.rbcd_delegation
+    platform: ad
+    category: ad_delegation
+    severity: high
+    description: "Resource-based constrained delegation configured — a frequently abused privilege-escalation primitive (design W18)"
+    match:
+      all:
+        - {field: kind, op: eq, value: rbcd}
+
+  - id: policy.ad.krbtgt_password_stale
+    platform: ad
+    category: ad_krbtgt
+    severity: high
+    description: "krbtgt password older than 180 days — never rotated; weakens golden-ticket resilience (design W18)"
+    # The dangerous EVENT — a krbtgt password RESET (age suddenly dropping, often
+    # golden-ticket preparation) — is a change and is caught by
+    # drift.ad.ad_krbtgt (changed). This baseline-free rule instead flags the
+    # hygiene condition the DSL can express: a stale, never-rotated krbtgt.
+    match:
+      all:
+        - {field: pwd_age_days, op: gt, value: 180}

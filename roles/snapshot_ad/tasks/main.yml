@@ -1,0 +1,95 @@
+---
+# roles/snapshot_ad/tasks/main.yml
+#
+# AD enrichment collector — one document PER DOMAIN (design §4.2 W18).
+# Orchestration only: detect RSAT + resolve the domain identity, run each category
+# collector (RSAT via win_powershell, or the reduced-fidelity LDAP fallback), then
+# assemble and write the snapshot on the control node.
+#
+# READ-ONLY GUARANTEE (scripts/lint_readonly.py):
+#   * every win_powershell task carries tags: [readonly] (asserts the script only reads)
+#   * the ONLY write modules used are file/template, and ONLY delegate_to: localhost
+#     (assembling the snapshot on the control node — never a target).
+
+- name: Initialise AD snapshot accumulators
+  ansible.builtin.set_fact:
+    dw_ad_failed_categories: []
+    ad_admins_items: []
+    ad_privileged_groups_items: []
+    ad_gpos_items: []
+    ad_dcsync_items: []
+    ad_delegation_items: []
+    ad_kerberoastable_items: []
+    ad_krbtgt_obj: {}
+    ad_adminsdholder_obj: {}
+    ad_collected_at: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+- name: Detect RSAT ActiveDirectory module and resolve domain identity
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      $info = @{
+        rsat = $false
+        fqdn = $null
+        dn   = $null
+        os   = $null
+      }
+      $mod = Get-Module -ListAvailable -Name ActiveDirectory
+      if ($mod) {
+        Import-Module ActiveDirectory -ErrorAction Stop
+        $info.rsat = $true
+        $d = Get-ADDomain -ErrorAction Stop
+        $info.fqdn = [string]$d.DNSRoot
+        $info.dn   = [string]$d.DistinguishedName
+        $dfl = [string]$d.DomainMode
+        $ffl = ''
+        try {
+          $f = Get-ADForest -ErrorAction Stop
+          $ffl = [string]$f.ForestMode
+        } catch { }
+        if ($ffl) {
+          $info.os = "Active Directory DS (DFL=$dfl, FFL=$ffl)"
+        } else {
+          $info.os = "Active Directory DS (DFL=$dfl)"
+        }
+      }
+      $Ansible.Result = $info
+  register: ad_env
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Resolve AD collection context
+  ansible.builtin.set_fact:
+    ad_rsat_available: "{{ (ad_env.result.rsat | default(false)) | bool }}"
+    ad_domain_fqdn: "{{ ad_env.result.fqdn | default(dw_ad_domain_fqdn, true) | default('unknown-domain', true) }}"
+    ad_domain_dn: "{{ ad_env.result.dn | default(dw_ad_domain_dn, true) | default('', true) }}"
+    ad_domain_os: "{{ ad_env.result.os | default('Active Directory DS', true) }}"
+
+- name: Collect AD enrichment via RSAT (win_powershell / Get-AD*)
+  when: ad_rsat_available | bool
+  block:
+    - name: ad_admins
+      ansible.builtin.include_tasks: ad_admins.yml
+    - name: ad_privileged_groups
+      ansible.builtin.include_tasks: ad_privileged_groups.yml
+    - name: ad_gpos
+      ansible.builtin.include_tasks: ad_gpos.yml
+    - name: ad_dcsync
+      ansible.builtin.include_tasks: ad_dcsync.yml
+    - name: ad_delegation
+      ansible.builtin.include_tasks: ad_delegation.yml
+    - name: ad_kerberoastable
+      ansible.builtin.include_tasks: ad_kerberoastable.yml
+    - name: ad_krbtgt
+      ansible.builtin.include_tasks: ad_krbtgt.yml
+    - name: ad_adminsdholder
+      ansible.builtin.include_tasks: ad_adminsdholder.yml
+
+- name: Collect AD enrichment via LDAP fallback (RSAT absent)
+  ansible.builtin.include_tasks: ldap_fallback.yml
+  when: not (ad_rsat_available | bool)
+
+- name: Assemble and write the AD snapshot document on the control node
+  ansible.builtin.include_tasks: assemble.yml

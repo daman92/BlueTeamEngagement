@@ -1,0 +1,45 @@
+---
+# tasks/sudoers.yml — L10 sudoers (CONTRACTS §3.1 `sudoers`)
+# identity: file | other: sha256, grants (sorted list of grant strings)
+#
+# /etc/sudoers + /etc/sudoers.d/* — file hash plus the parsed grant lines
+# (whitespace-collapsed non-comment lines, keeping Defaults / aliases / #include
+# directives: all of them change sudo's effective policy). Any change = High
+# (design L10). A bare record per file guarantees empty files still appear.
+# Record (grant last — free text): file | sha256 | grant
+
+- name: L10 collect sudoers files and grants (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    for sf in /etc/sudoers /etc/sudoers.d/*; do
+      [ -f "$sf" ] || continue
+      case "$sf" in *~|*.bak|*.rpmnew|*.rpmsave|*.dpkg-new|*.dpkg-old) continue ;; esac
+      fh=$(sha256sum "$sf" 2>/dev/null | awk '{print $1}')
+      printf '%s\n' "$sf$US$fh$US"
+      awk -v US="$US" -v f="$sf" -v fh="$fh" '
+        {
+          line=$0; sub(/^[[:space:]]+/,"",line); gsub(/[[:space:]]+/," ",line)
+          if (line == "") next
+          if (line ~ /^#/ && line !~ /^#include/) next
+          print f US fh US line
+        }' "$sf"
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_sudoers
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L10 stash sudoers records
+  ansible.builtin.set_fact:
+    dw_raw_sudoers: "{{ dw_sudoers.stdout | default('') }}"
+
+- name: L10 mark sudoers failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['sudoers'] }}"
+  when: (dw_sudoers.rc | default(1)) != 0

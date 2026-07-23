@@ -1,0 +1,57 @@
+---
+# W9a users (CONTRACTS §3.2 `users`)
+# identity: sid | volatile: last_logon
+# other:    name, enabled, description, pw_last_set, profile_ctime, rid
+#
+# Local creation date is not a stored property (design W9); profile_ctime (profile-folder
+# CreationTime) and rid (last SID component) are the derivable approximations — a low RID
+# reappearing or RID-500 re-enabled is itself a signal the diff engine will surface.
+
+- name: "W9a local users"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $profBySid = @{}
+      foreach ($pf in (Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue)) {
+        if ($pf.SID) { $profBySid["$($pf.SID)"] = $pf.LocalPath }
+      }
+
+      $out = foreach ($u in (Get-LocalUser -ErrorAction Stop)) {
+        $sid = "$($u.SID.Value)"
+        $rid = $null
+        if ($sid -match '-(\d+)$') { $rid = [int]$matches[1] }
+
+        $pls = $null; if ($u.PasswordLastSet) { $pls = $u.PasswordLastSet.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+        $ll  = $null; if ($u.LastLogon)       { $ll  = $u.LastLogon.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+
+        $pctime = $null
+        if ($profBySid.ContainsKey($sid)) {
+          $lp = $profBySid[$sid]
+          if ($lp -and (Test-Path -LiteralPath $lp)) {
+            try { $pctime = (Get-Item -LiteralPath $lp -Force -ErrorAction Stop).CreationTimeUtc.ToString('yyyy-MM-ddTHH:mm:ssZ') } catch {}
+          }
+        }
+
+        [ordered]@{
+          sid           = $sid
+          last_logon    = $ll
+          name          = $u.Name
+          enabled       = [bool]$u.Enabled
+          description   = $u.Description
+          pw_last_set   = $pls
+          profile_ctime = $pctime
+          rid           = $rid
+        }
+      }
+      $out
+  register: reg_users
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record users collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['users'] }}"
+  when: reg_users is failed

@@ -1,0 +1,73 @@
+# driftwatch — engagement scope.yml TEMPLATE (CONTRACTS.md §1.4; design §15.2)
+# =============================================================================
+# scope.yml is the authorization rail. It is the ONLY source for inventory
+# generation and the single place that says which addresses this engagement is
+# allowed to touch. It fails CLOSED: as shipped, this template authorizes
+# NOTHING (in_scope is empty), and scripts/scope_gate.py refuses to run until an
+# analyst deliberately adds authorized ranges/hosts.
+#
+# Stand up a real engagement with `bin/driftwatch new-engagement <id>` (which
+# scaffolds the volume and writes an equivalent scope.yml), or copy this file by
+# hand — this is the fully-annotated reference. Then fill in the fields below.
+# Do not commit a filled-in copy — real engagement volumes are git-ignored; only
+# this template is tracked.
+#
+# Touching a host you are not authorized for is unauthorized access regardless
+# of intent (design §15.2). Fill this in from the SIGNED authorization document,
+# not from what happens to be reachable.
+# =============================================================================
+
+engagement: ""            # <client>-<yyyy>-<mm>, e.g. "acme-2026-07". Must match the volume dir name.
+client: ""                # human-readable client name, e.g. "ACME Corp"
+authorized_by: ""         # REQUIRED free text: who authorized, and the SOW/authorization reference,
+                          #   e.g. "J. Doe, CISO (signed SOW 2026-07-01)". No run proceeds without this.
+
+# --- in_scope: the allow-list -------------------------------------------------
+# The ONLY source of authorized targets. Two entry forms:
+#
+#   - cidr: 10.10.0.0/16        # an authorized RANGE. A bare CIDR does NOT create
+#     groups: [linux]           #   addressable inventory hosts — hosts discovered
+#                               #   inside it must be added explicitly (as host/ip
+#                               #   entries) before they are ever touched
+#                               #   (discovery != access, design §15.2).
+#
+#   - host: dc01.acme.example   # an explicit host -> becomes an inventory host.
+#     ip: 10.10.1.5             #   Always use FQDNs for Windows/Kerberos (design §3.1).
+#     groups: [windows, win_servers, crown_jewels]
+#
+# `groups` are the Ansible groups the host/range is placed in; they must line up
+# with inventory/group_vars/*.yml (linux | windows | network | ad + sub-groups).
+# Empty list below = nothing authorized = fail-closed default. Replace it.
+in_scope: []
+
+# --- deny: explicit never-touch ----------------------------------------------
+# Wins over in_scope. Use for carve-outs inside an authorized range (safety
+# systems, third-party-managed hosts, out-of-contract subnets).
+#   - cidr: 10.10.99.0/24
+#   - ip: 10.10.1.9
+deny: []
+
+# --- oob_subnets: out-of-band management ranges ------------------------------
+# Devices NOT in one of these are assumed IN-BAND, meaning the path you manage
+# them over may be the path a change would sever. Used by the response layer to
+# force rollback timers and in-band warnings (design §13.5). Collection is
+# read-only, so this is advisory here; it matters at respond time.
+#   - 10.0.255.0/24
+oob_subnets: []
+
+# --- settings ----------------------------------------------------------------
+settings:
+  hash_policy: tiered                 # full | tiered | servers_only (design C.2).
+                                      #   tiered = hash everything on servers/DCs/crown_jewels,
+                                      #   only the interesting subset on workstations.
+  collector_account: svc-driftwatch   # this engagement's collector identity. normalize.py tags
+                                      #   items owned by it collector_self=true; diff_engine caps
+                                      #   their severity at info (hijack stays visible).
+  outlier_max_prevalence: 0.05        # fleet-outlier: flag an item present on <= 5% ...
+  outlier_min_group: 20               #   ... of a group with >= 20 members.
+  fast_interval: 2h                   # informational; the systemd timer units read these.
+  deep_interval: 24h                  #   deep = hashing, package inventory, cert stores.
+  splunk_hec_url: ""                  # empty = Splunk shipping disabled.
+  splunk_hec_token_var: vault_splunk_hec_token   # NAME of the vault variable holding the token,
+                                                 #   never the token itself.
+  elastic_url: ""                     # empty = Security Onion / Elastic shipping disabled.

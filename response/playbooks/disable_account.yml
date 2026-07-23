@@ -1,0 +1,158 @@
+---
+# =============================================================================
+# Tier-1 response play · disable_account   (design §13.3 / §13.4 / §13.6)
+#
+# Reversible containment: DISABLE (never delete) the named account so it can no
+# longer authenticate, while every artifact needed to understand it is preserved.
+# Deleting is a Tier-3 eradication decision made later, per host, after evidence.
+#
+# Mandatory pattern (design §13.2 / §13.5), enforced by structure below:
+#   PRESERVE  -> capture live account state to the evidence store (always, even in
+#                --check) BEFORE any change. No preservation, no action.
+#   --check   -> the ACT task honours check mode: a dry run only reports what WOULD
+#                change and touches nothing.
+#   confirm   -> the play refuses to mutate unless dw_authorized is true (respond.py
+#                sets it only after the analyst's explicit approval).
+#   serial: 1 -> canary one host at a time; any_errors_fatal halts the batch on the
+#                first failure so a mistake never fans out across the fleet.
+#   ACT / ROLLBACK -> reverse branch (dw_rollback) re-enables the account.
+#
+# Invoked by response/scripts/respond.py, which passes the dw_* extra-vars.
+# Ansible does not run in this repo; this file is the reviewed, valid definition.
+# =============================================================================
+
+- name: "Tier-1 · disable_account (reversible)"
+  hosts: "{{ dw_target_hosts | mandatory }}"
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  # dw_case_id, dw_account, dw_platform, dw_evidence_dir, dw_audit_log,
+  # dw_authorized and dw_rollback arrive as extra-vars from respond.py. They are
+  # deliberately NOT re-declared under vars: — a play var of the form
+  # dw_x: "{{ dw_x | default(...) }}" is a fatal recursive template in Ansible.
+  # The GATE below asserts their presence instead.
+  vars:
+    dw_tier: 1
+    dw_reversible: true
+
+  pre_tasks:
+    - name: "GATE · required dw_* extra-vars are present (passed by respond.py)"
+      ansible.builtin.assert:
+        that:
+          - dw_case_id is defined
+          - dw_account is defined
+          - dw_platform is defined
+          - dw_evidence_dir is defined
+          - dw_audit_log is defined
+          - dw_authorized is defined
+          - dw_rollback is defined
+        fail_msg: >-
+          Missing required dw_* extra-vars. This play is invoked by
+          response/scripts/respond.py, which supplies them with -e; do not run it
+          by hand without providing the full set.
+
+    - name: "GATE · refuse to change anything without an approved case"
+      ansible.builtin.assert:
+        that:
+          - "dw_authorized | bool"
+        fail_msg: >-
+          Case {{ dw_case_id }} is not approved. Run `respond approve --case
+          {{ dw_case_id }}` first. (Dry runs with --check skip this gate.)
+        success_msg: "Approved action for case {{ dw_case_id }}."
+      when: not ansible_check_mode
+
+  tasks:
+    # ---- PRESERVE (read-only, always runs, even in --check) -----------------
+    - name: "PRESERVE · read current account state (Windows)"
+      ansible.windows.win_powershell:
+        script: |
+          Get-LocalUser -Name '{{ dw_account }}' |
+            Select-Object Name, Enabled, SID, LastLogon, PasswordLastSet |
+            ConvertTo-Json -Depth 3
+      register: dw_before_win
+      check_mode: false
+      changed_when: false
+      # A domain or unknown account makes Get-LocalUser error; still record that
+      # as the before-state (the ACT task will fail loudly on its own if the
+      # account is not manageable here).
+      failed_when: false
+      when: dw_platform == 'windows'
+
+    - name: "PRESERVE · read current account state (Linux)"
+      ansible.builtin.command:
+        cmd: "getent passwd {{ dw_account }}"
+      register: dw_before_linux
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: dw_platform != 'windows'
+
+    - name: "PRESERVE · write before-state to the evidence store (control node)"
+      ansible.builtin.copy:
+        dest: "{{ dw_evidence_dir }}/{{ inventory_hostname }}.account_before.json"
+        content: >-
+          {{ {'host': inventory_hostname, 'account': dw_account,
+              'platform': dw_platform,
+              'state': (dw_before_win.output | default(dw_before_win.host_out) |
+                        default(dw_before_linux.stdout) | default('unknown'))}
+             | to_nice_json }}
+      delegate_to: localhost
+      check_mode: false
+
+    # ---- ACT (contain) ------------------------------------------------------
+    - name: "ACT · disable account (Windows) — honours --check"
+      ansible.windows.win_user:
+        name: "{{ dw_account }}"
+        account_disabled: true
+      register: dw_act_win
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform == 'windows'
+
+    - name: "ACT · lock password AND expire the account (Linux) — honours --check"
+      ansible.builtin.user:
+        name: "{{ dw_account }}"
+        password_lock: true
+        # password_lock alone only blocks password auth — an attacker holding an
+        # authorized_key on the account would be untouched. expires: 0 marks the
+        # account expired (epoch 0) so PAM/sshd refuse EVERY auth method,
+        # including public key. Both are reversible (see ROLLBACK).
+        expires: 0
+      register: dw_act_linux
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform != 'windows'
+
+    # ---- ROLLBACK (reverse using the reversible action) ---------------------
+    - name: "ROLLBACK · re-enable account (Windows)"
+      ansible.windows.win_user:
+        name: "{{ dw_account }}"
+        account_disabled: false
+      when:
+        - dw_rollback | bool
+        - dw_platform == 'windows'
+
+    - name: "ROLLBACK · unlock password and remove account expiry (Linux)"
+      ansible.builtin.user:
+        name: "{{ dw_account }}"
+        password_lock: false
+        expires: -1     # -1 removes the expiry set by ACT
+      when:
+        - dw_rollback | bool
+        - dw_platform != 'windows'
+
+  post_tasks:
+    - name: "LOG · append this play's action to the append-only audit log"
+      ansible.builtin.lineinfile:
+        path: "{{ dw_audit_log }}"
+        create: true
+        insertafter: EOF
+        line: >-
+          {{ now(true, '%Y-%m-%dT%H:%M:%SZ') }} | play=disable_account |
+          case={{ dw_case_id }} | host={{ inventory_hostname }} |
+          account={{ dw_account }} |
+          action={{ 'rollback' if (dw_rollback | bool) else 'disable' }} |
+          outcome=ok
+      delegate_to: localhost
+      check_mode: false
+      when: not ansible_check_mode

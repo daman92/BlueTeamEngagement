@@ -1,0 +1,117 @@
+---
+# W7 autoruns (CONTRACTS §3.2 `autoruns`)
+# identity: location, name, command | other: hash   (location = full registry path or folder)
+#
+# Enumerates: Run/RunOnce (HKLM + all loaded HKU hives, incl. Wow6432Node), Startup
+# folders (all-users + per-profile), Winlogon Shell/Userinit, IFEO Debugger keys,
+# AppInit_DLLs, and LSA Security/Notification/Authentication packages (design W7). `hash`
+# is the sha256 of the referenced on-disk file when one can be resolved, else null.
+
+- name: "W7 autoruns"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+      function Add-Autorun($location, $name, $command) {
+        if ($null -eq $name) { return }
+        $hash = $null
+        $target = $null
+        if ($command) {
+          $c = "$command".Trim()
+          if ($c.StartsWith('"')) {
+            $e = $c.IndexOf('"', 1)
+            if ($e -gt 0) { $target = $c.Substring(1, $e - 1) }
+          } else {
+            $m = [regex]::Match($c, '^([^\s]+\.(exe|dll|sys|bat|cmd|ps1|vbs|scr|com))', 'IgnoreCase')
+            if ($m.Success) { $target = $m.Groups[1].Value }
+          }
+        }
+        if ($target) {
+          $expanded = [Environment]::ExpandEnvironmentVariables($target)
+          if (Test-Path -LiteralPath $expanded -PathType Leaf -ErrorAction SilentlyContinue) {
+            try { $hash = (Get-FileHash -LiteralPath $expanded -Algorithm SHA256 -ErrorAction Stop).Hash } catch {}
+          }
+        }
+        [void]$out.Add([ordered]@{ location = "$location"; name = "$name"; command = "$command"; hash = $hash })
+      }
+
+      # Run / RunOnce — HKLM (native + Wow6432Node) and every loaded HKU hive.
+      $runKeys = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\RunOnce'
+      )
+      foreach ($u in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        $sid = $u.PSChildName
+        if ($sid -match '_Classes$') { continue }
+        $runKeys += "Registry::HKEY_USERS\$sid\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+        $runKeys += "Registry::HKEY_USERS\$sid\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+        $runKeys += "Registry::HKEY_USERS\$sid\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"
+      }
+      foreach ($k in $runKeys) {
+        $props = Get-ItemProperty -Path $k -ErrorAction SilentlyContinue
+        if ($props) {
+          foreach ($p in $props.PSObject.Properties) {
+            if ($p.Name -like 'PS*') { continue }
+            Add-Autorun $k $p.Name $p.Value
+          }
+        }
+      }
+
+      # Startup folders — all-users + each real user profile.
+      $startupFolders = @((Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Startup'))
+      foreach ($prof in (Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue)) {
+        if ($prof.LocalPath) { $startupFolders += (Join-Path $prof.LocalPath 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup') }
+      }
+      foreach ($f in ($startupFolders | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $f) {
+          foreach ($item in (Get-ChildItem -LiteralPath $f -File -ErrorAction SilentlyContinue)) {
+            Add-Autorun $f $item.Name $item.FullName
+          }
+        }
+      }
+
+      # Winlogon Shell / Userinit.
+      $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+      $wlp = Get-ItemProperty -Path $wl -ErrorAction SilentlyContinue
+      if ($wlp) {
+        Add-Autorun $wl 'Shell' $wlp.Shell
+        Add-Autorun $wl 'Userinit' $wlp.Userinit
+      }
+
+      # Image File Execution Options — Debugger hijacks.
+      $ifeo = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
+      foreach ($sub in (Get-ChildItem -Path $ifeo -ErrorAction SilentlyContinue)) {
+        $dbg = (Get-ItemProperty -Path $sub.PSPath -ErrorAction SilentlyContinue).Debugger
+        if ($dbg) { Add-Autorun $sub.PSPath 'Debugger' $dbg }
+      }
+
+      # AppInit_DLLs (native + Wow6432Node).
+      foreach ($ai in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows',
+        'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows NT\CurrentVersion\Windows')) {
+        $dll = (Get-ItemProperty -Path $ai -ErrorAction SilentlyContinue).AppInit_DLLs
+        if ($dll) { Add-Autorun $ai 'AppInit_DLLs' $dll }
+      }
+
+      # LSA packages.
+      $lsa = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'
+      $lsap = Get-ItemProperty -Path $lsa -ErrorAction SilentlyContinue
+      if ($lsap) {
+        if ($lsap.'Security Packages')       { Add-Autorun $lsa 'Security Packages'       (@($lsap.'Security Packages') -join ';') }
+        if ($lsap.'Notification Packages')   { Add-Autorun $lsa 'Notification Packages'   (@($lsap.'Notification Packages') -join ';') }
+        if ($lsap.'Authentication Packages') { Add-Autorun $lsa 'Authentication Packages' (@($lsap.'Authentication Packages') -join ';') }
+      }
+      $out
+  register: reg_autoruns
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record autoruns collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['autoruns'] }}"
+  when: reg_autoruns is failed

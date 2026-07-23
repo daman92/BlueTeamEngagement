@@ -1,0 +1,14 @@
+# The repo is authored on Windows (core.autocrlf=true) but every executable and
+# config here runs on the Linux kit control node. A stray CR in the operator
+# console shebang or in a systemd unit is a silent, painful failure, so pin these
+# file types to LF in the working tree regardless of the checkout platform.
+bin/driftwatch      text eol=lf
+*.sh                text eol=lf
+*.py                text eol=lf
+*.yml               text eol=lf
+*.yaml              text eol=lf
+*.cfg               text eol=lf
+*.j2                text eol=lf
+*.service           text eol=lf
+*.timer             text eol=lf
+*.ndjson            text eol=lf

@@ -1,0 +1,52 @@
+---
+# roles/snapshot_ad/defaults/main.yml
+#
+# Read-only AD enrichment collector (design §4.2 W18, CONTRACTS.md §3.3 `ad`).
+# Runs ONCE PER DOMAIN — delegate the whole play to a single domain controller or a
+# domain-joined Windows host and use run_once semantics (see README). The role writes
+# NOTHING to targets; the assembled snapshot is written on the control node only.
+
+# ---------------------------------------------------------------------------
+# Shared driftwatch variables (normally supplied via -e or group_vars; defaults
+# here keep the role runnable/testable in isolation). Do NOT rely on these
+# defaults in a real run — the CLI passes the real values.
+# ---------------------------------------------------------------------------
+dw_engagement: ""                       # engagement id, e.g. acme-2026-07
+dw_engagement_dir: ""                   # absolute path to the engagement volume
+dw_run_id: "manual"                     # UTC %Y-%m-%dT%H%MZ, set once per run by the CLI
+dw_snapshot_dir: "{{ dw_engagement_dir }}/snapshots"
+dw_deep: false                          # gate expensive categories (SYSVOL script/task walk)
+dw_hash_policy: "tiered"                # full | tiered | servers_only
+
+# ---------------------------------------------------------------------------
+# Privileged groups to fully (recursively) expand. Domain Admins / Enterprise
+# Admins / Schema Admins / Account Operators / Backup Operators / DnsAdmins are
+# mandated by W18; the rest are common local-admin-granting / tier-0 groups. Any
+# additional group that grants local admin in the target estate should be added
+# here per engagement (via -e or group_vars) so ad_privileged_groups expands it.
+# ---------------------------------------------------------------------------
+dw_ad_privileged_groups:
+  - "Domain Admins"
+  - "Enterprise Admins"
+  - "Schema Admins"
+  - "Account Operators"
+  - "Backup Operators"
+  - "DnsAdmins"
+  - "Administrators"          # BUILTIN\Administrators — grants local admin on DCs
+  - "Server Operators"
+  - "Print Operators"
+  - "Group Policy Creator Owners"
+  - "Key Admins"
+  - "Enterprise Key Admins"
+
+# ---------------------------------------------------------------------------
+# LDAP fallback (community.general.ldap_search), used only when the RSAT
+# ActiveDirectory PowerShell module is absent on the delegated host. Fidelity is
+# reduced (see README + tasks/ldap_fallback.yml); RSAT is strongly preferred.
+# Provide these (bind_pw from the engagement vault) to enable the fallback.
+# ---------------------------------------------------------------------------
+dw_ad_domain_fqdn: ""                   # override for meta.host if RSAT can't resolve it
+dw_ad_domain_dn: ""                     # override for the domain DN (LDAP search base)
+dw_ad_ldap_server: ""                   # DC hostname/IP for the LDAP fallback
+dw_ad_ldap_bind_dn: ""                  # bind DN, e.g. CN=svc-driftwatch,OU=...,DC=...
+dw_ad_ldap_bind_pw: ""                  # bind password — source from ansible-vault, never inline

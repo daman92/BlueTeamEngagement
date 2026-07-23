@@ -1,0 +1,414 @@
+{#-
+  driftwatch Linux snapshot document (CONTRACTS §2 / §3.1).
+
+  The category task files stash raw US(0x1F)-delimited records as dw_raw_* facts;
+  this template parses them into the EXACT §3.1 field sets and serializes the
+  complete document on the CONTROL NODE. The snapshot is RAW: volatile fields
+  (pid, ppid, started, next_run, last_run, size, used_by, count, last_login) are
+  kept as attributes and stripped later by scripts/normalize.py — this template
+  never pre-normalizes beyond producing the documented fields.
+
+  Top-level keys are exactly: meta + the 20 CONTRACTS.md §3.1 `linux` categories.
+  Where a record's last field is free text, the emitter puts it last and the
+  parser uses a bounded split so an embedded delimiter cannot shift columns.
+-#}
+{%- set US = "\x1f" -%}
+
+{#- ---- meta --------------------------------------------------------------- -#}
+{%- set hm = (dw_raw_hostmeta | default('')).strip().split(US) -%}
+{%- set fallback_ts = now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') -%}
+{%- set meta = {
+      "schema_version": "1.0",
+      "host": inventory_hostname,
+      "platform": "linux",
+      "os": (hm[0] if hm[0] else "Linux"),
+      "collected_at": (hm[1] if (hm | length > 1 and hm[1]) else fallback_ts),
+      "collector_version": "driftwatch 0.1.0",
+      "engagement": dw_engagement,
+      "run_id": dw_run_id,
+      "partial": (dw_failed_categories | default([]) | length > 0),
+      "failed_categories": (dw_failed_categories | default([]) | unique | sort),
+      "hash_policy": dw_hash_policy
+    } -%}
+
+{#- ---- L1 processes / L2 fileless ----------------------------------------- -#}
+{#- record: path|sha256|user|pid|ppid|started|indicator|detail|args -#}
+{%- set processes = [] -%}
+{%- set fileless = [] -%}
+{%- for line in (dw_raw_processes | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 8) -%}
+  {%- if f | length >= 9 -%}
+    {%- set _ = processes.append({
+          "path": f[0],
+          "sha256": (f[1] if f[1] else none),
+          "user": f[2],
+          "args_norm": (f[8].split() | join(" ")),
+          "pid": (f[3] | int(-1)),
+          "ppid": (f[4] | int(-1)),
+          "started": (f[5] if f[5] else none),
+          "args": f[8],
+          "signed_na": true
+        }) -%}
+    {%- if f[6] -%}
+      {%- set _ = fileless.append({
+            "indicator": f[6],
+            "path": f[0],
+            "user": f[2],
+            "pid": (f[3] | int(-1)),
+            "detail": f[7]
+          }) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L3 listening -------------------------------------------------------- -#}
+{#- record: proto|port|path|pid|bind|user -#}
+{%- set listening = [] -%}
+{%- for line in (dw_raw_listening | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 5) -%}
+  {%- if f | length >= 6 and (f[1] | int(-1)) >= 0 -%}
+    {%- set _ = listening.append({
+          "proto": f[0],
+          "port": (f[1] | int(-1)),
+          "path": f[2],
+          "pid": (f[3] | int(-1)),
+          "bind": f[4],
+          "user": f[5]
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L4 connections (aggregated to identity tuple + count) --------------- -#}
+{#- record: proto|remote_ip|remote_port|path|pid|user -#}
+{%- set conn_agg = {} -%}
+{%- for line in (dw_raw_connections | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 5) -%}
+  {%- if f | length >= 6 and (f[2] | int(-1)) >= 0
+        and f[1] not in ("127.0.0.1", "::1", "[::1]") -%}
+    {%- set key = f[0] ~ "|" ~ f[1] ~ "|" ~ f[2] ~ "|" ~ f[3] -%}
+    {%- if key in conn_agg -%}
+      {%- set _ = conn_agg[key].update({"count": conn_agg[key]["count"] + 1}) -%}
+    {%- else -%}
+      {%- set _ = conn_agg.update({key: {
+            "path": f[3],
+            "remote_ip": f[1],
+            "remote_port": (f[2] | int(-1)),
+            "proto": f[0],
+            "count": 1,
+            "user": f[5]
+          }}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set connections = conn_agg.values() | list -%}
+
+{#- ---- L5 cron ------------------------------------------------------------- -#}
+{#- record: source|user|schedule|file_hash|command -#}
+{%- set cron = [] -%}
+{%- for line in (dw_raw_cron | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 4) -%}
+  {%- if f | length >= 5 -%}
+    {%- set _ = cron.append({
+          "source": f[0],
+          "user": f[1],
+          "schedule": f[2],
+          "command": f[4],
+          "file_hash": (f[3] if f[3] else none)
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L6 systemd_units (merge uf / tr / di record types) ------------------ -#}
+{%- set su_map = {} -%}
+{%- set su_dropins = [] -%}
+{%- for line in (dw_raw_systemd_units | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US) -%}
+  {%- if f[0] == "uf" and f | length >= 5 -%}
+    {%- set _ = su_map.update({f[1] ~ "|" ~ f[2]: {
+          "kind": f[1], "name": f[2],
+          "enabled_state": f[3],
+          "file_hash": (f[4] if f[4] else none),
+          "next_run": none, "last_run": none
+        }}) -%}
+  {%- elif f[0] == "tr" and f | length >= 4 -%}
+    {%- set key = "timer|" ~ f[1] -%}
+    {%- if key not in su_map -%}
+      {%- set _ = su_map.update({key: {
+            "kind": "timer", "name": f[1], "enabled_state": "",
+            "file_hash": none, "next_run": none, "last_run": none
+          }}) -%}
+    {%- endif -%}
+    {%- set _ = su_map[key].update({
+          "next_run": (f[2] if f[2] else none),
+          "last_run": (f[3] if f[3] else none)
+        }) -%}
+  {%- elif f[0] == "di" and f | length >= 3 -%}
+    {%- set _ = su_dropins.append({
+          "kind": "dropin", "name": f[1], "enabled_state": "",
+          "file_hash": (f[2] if f[2] else none),
+          "next_run": none, "last_run": none
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set systemd_units = (su_map.values() | list) + su_dropins -%}
+
+{#- ---- L7 persistence ------------------------------------------------------ -#}
+{#- record: mechanism|path|present|content_hash -#}
+{%- set persistence = [] -%}
+{%- for line in (dw_raw_persistence | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 3) -%}
+  {%- if f | length >= 4 -%}
+    {%- set _ = persistence.append({
+          "mechanism": f[0],
+          "path": f[1],
+          "present": (f[2] == "true"),
+          "content_hash": (f[3] if f[3] else none)
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L8a users ----------------------------------------------------------- -#}
+{#- record: name|uid|gid|shell|home|locked|pw_last_set|home_ctime|last_login|groups_csv -#}
+{%- set users = [] -%}
+{%- for line in (dw_raw_users | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 9) -%}
+  {%- if f | length >= 10 -%}
+    {%- set _ = users.append({
+          "name": f[0],
+          "uid": (f[1] | int(-1)),
+          "gid": (f[2] | int(-1)),
+          "shell": f[3],
+          "home": f[4],
+          "locked": (f[5] == "true"),
+          "pw_last_set": (f[6] if f[6] else none),
+          "home_ctime": (f[7] if f[7] else none),
+          "last_login": (f[8] if f[8] else none),
+          "groups": (f[9].split(",") | reject("equalto", "") | list | sort)
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L8b groups ---------------------------------------------------------- -#}
+{#- record: name|gid|members_csv -#}
+{%- set groups = [] -%}
+{%- for line in (dw_raw_groups | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f | length >= 3 -%}
+    {%- set _ = groups.append({
+          "name": f[0],
+          "gid": (f[1] | int(-1)),
+          "members": (f[2].split(",") | reject("equalto", "") | list | sort)
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L9a ssh_keys (deduped on user+fingerprint) -------------------------- -#}
+{#- record: user|fingerprint|key_type|file|comment -#}
+{%- set sk_map = {} -%}
+{%- for line in (dw_raw_ssh_keys | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 4) -%}
+  {%- if f | length >= 5 -%}
+    {%- set key = f[0] ~ "|" ~ f[1] -%}
+    {%- if key not in sk_map -%}
+      {%- set _ = sk_map.update({key: {
+            "user": f[0],
+            "fingerprint": f[1],
+            "key_type": f[2],
+            "comment": f[4],
+            "file": f[3]
+          }}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ssh_keys = sk_map.values() | list -%}
+
+{#- ---- L9b ssh_config (object) --------------------------------------------- -#}
+{#- records: hash|<sha256>  ·  eff|<key>|<value> -#}
+{%- set ssh_effective = {} -%}
+{%- set ssh_config = {
+      "file_hash": none,
+      "permit_root_login": none,
+      "password_authentication": none,
+      "effective": ssh_effective
+    } -%}
+{%- for line in (dw_raw_ssh_config | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f[0] == "hash" and f | length >= 2 -%}
+    {%- set _ = ssh_config.update({"file_hash": (f[1] if f[1] else none)}) -%}
+  {%- elif f[0] == "eff" and f | length >= 3 -%}
+    {%- if f[1] in ssh_effective -%}
+      {%- set _ = ssh_effective.update({f[1]: ssh_effective[f[1]] ~ "," ~ f[2]}) -%}
+    {%- else -%}
+      {%- set _ = ssh_effective.update({f[1]: f[2]}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set _ = ssh_config.update({
+      "permit_root_login": ssh_effective.get("permitrootlogin"),
+      "password_authentication": ssh_effective.get("passwordauthentication")
+    }) -%}
+
+{#- ---- L10 sudoers (group grant lines per file, grants sorted) ------------- -#}
+{#- record: file|sha256|grant -#}
+{%- set sud_map = {} -%}
+{%- for line in (dw_raw_sudoers | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f | length >= 3 -%}
+    {%- if f[0] not in sud_map -%}
+      {%- set _ = sud_map.update({f[0]: {
+            "file": f[0],
+            "sha256": (f[1] if f[1] else none),
+            "grants": []
+          }}) -%}
+    {%- endif -%}
+    {%- if f[2] -%}
+      {%- set _ = sud_map[f[0]]["grants"].append(f[2]) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set sudoers = [] -%}
+{%- for e in sud_map.values() -%}
+  {%- set _ = sudoers.append({
+        "file": e["file"],
+        "sha256": e["sha256"],
+        "grants": (e["grants"] | sort)
+      }) -%}
+{%- endfor -%}
+
+{#- ---- L11a kernel_modules ------------------------------------------------- -#}
+{#- record: name|size|used_by|sha256 -#}
+{%- set kernel_modules = [] -%}
+{%- for line in (dw_raw_kernel_modules | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 3) -%}
+  {%- if f | length >= 4 -%}
+    {%- set _ = kernel_modules.append({
+          "name": f[0],
+          "sha256": (f[3] if f[3] else none),
+          "size": (f[1] | int(-1)),
+          "used_by": f[2]
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L11b kernel_state (object) ------------------------------------------ -#}
+{#- records: tainted|<value>  ·  sysctl|<key>|<value> -#}
+{%- set ks_sysctls = {} -%}
+{%- set kernel_state = {"tainted": 0, "sysctls": ks_sysctls} -%}
+{%- for line in (dw_raw_kernel_state | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f[0] == "tainted" and f | length >= 2 -%}
+    {%- set _ = kernel_state.update({"tainted": (f[1] | int(0))}) -%}
+  {%- elif f[0] == "sysctl" and f | length >= 3 -%}
+    {%- set _ = ks_sysctls.update({f[1]: f[2]}) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L12 packages -------------------------------------------------------- -#}
+{#- record: name|arch|version -#}
+{%- set packages = [] -%}
+{%- for line in (dw_raw_packages | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f | length >= 3 -%}
+    {%- set _ = packages.append({"name": f[0], "arch": f[1], "version": f[2]}) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L13 file_integrity -------------------------------------------------- -#}
+{#- record: kind|path|sha256|mode|owner|suid -#}
+{%- set file_integrity = [] -%}
+{%- for line in (dw_raw_file_integrity | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 5) -%}
+  {%- if f | length >= 6 -%}
+    {%- set _ = file_integrity.append({
+          "kind": f[0],
+          "path": f[1],
+          "sha256": (f[2] if f[2] else none),
+          "mode": f[3],
+          "owner": f[4],
+          "suid": (f[5] == "true")
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L14 firewall -------------------------------------------------------- -#}
+{#- record: table|chain|rule -#}
+{%- set firewall = [] -%}
+{%- for line in (dw_raw_firewall | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f | length >= 3 and f[2] -%}
+    {%- set _ = firewall.append({"rule": f[2], "table": f[0], "chain": f[1]}) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L15 dns_trust ------------------------------------------------------- -#}
+{#- record: kind|key|value -#}
+{%- set dns_trust = [] -%}
+{%- for line in (dw_raw_dns_trust | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 2) -%}
+  {%- if f | length >= 3 -%}
+    {%- set _ = dns_trust.append({"kind": f[0], "key": f[1], "value": f[2]}) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L16 shares ----------------------------------------------------------- -#}
+{#- record: kind|name|path|options -#}
+{%- set shares = [] -%}
+{%- for line in (dw_raw_shares | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 3) -%}
+  {%- if f | length >= 4 -%}
+    {%- set _ = shares.append({
+          "kind": f[0], "name": f[1], "path": f[2], "options": f[3]
+        }) -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- L17 logging_health (object) ----------------------------------------- -#}
+{%- set lh_targets = [] -%}
+{%- set logging_health = {
+      "rsyslog_active": false,
+      "journald_forward": false,
+      "auditd_active": false,
+      "audit_rules_hash": none,
+      "forward_targets": lh_targets
+    } -%}
+{%- for line in (dw_raw_logging_health | default('')).splitlines() if line.strip() -%}
+  {%- set f = line.split(US, 1) -%}
+  {%- if f | length >= 2 -%}
+    {%- if f[0] == "rsyslog_active" -%}
+      {%- set _ = logging_health.update({"rsyslog_active": (f[1] == "true")}) -%}
+    {%- elif f[0] == "journald_forward" -%}
+      {%- set _ = logging_health.update({"journald_forward": (f[1] == "true")}) -%}
+    {%- elif f[0] == "auditd_active" -%}
+      {%- set _ = logging_health.update({"auditd_active": (f[1] == "true")}) -%}
+    {%- elif f[0] == "audit_rules_hash" -%}
+      {%- set _ = logging_health.update({"audit_rules_hash": (f[1] if f[1] else none)}) -%}
+    {%- elif f[0] == "forward_target" and f[1] and f[1] not in lh_targets -%}
+      {%- set _ = lh_targets.append(f[1]) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- ---- document ------------------------------------------------------------ -#}
+{{ {
+  "meta": meta,
+  "processes": processes,
+  "fileless": fileless,
+  "listening": listening,
+  "connections": connections,
+  "cron": cron,
+  "systemd_units": systemd_units,
+  "persistence": persistence,
+  "users": users,
+  "groups": groups,
+  "ssh_keys": ssh_keys,
+  "ssh_config": ssh_config,
+  "sudoers": sudoers,
+  "kernel_modules": kernel_modules,
+  "kernel_state": kernel_state,
+  "packages": packages,
+  "file_integrity": file_integrity,
+  "firewall": firewall,
+  "dns_trust": dns_trust,
+  "shares": shares,
+  "logging_health": logging_health
+} | to_nice_json }}

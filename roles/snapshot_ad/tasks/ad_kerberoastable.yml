@@ -1,0 +1,41 @@
+---
+# tasks/ad_kerberoastable.yml — CONTRACTS.md §3.3 ad_kerberoastable
+# identity: sam | other: spns (sorted), enabled, pwd_last_set
+#
+# User accounts (not computer accounts) carrying a servicePrincipalName — the
+# Kerberoastable set (W18). krbtgt is excluded (tracked in ad_krbtgt).
+
+- name: Collect Kerberoastable accounts (ad_kerberoastable) via RSAT
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      function ConvertTo-IsoUtc($dt) {
+        if ($null -eq $dt) { return $null }
+        if ($dt -is [datetime]) { return $dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        return $null
+      }
+
+      $users = Get-ADUser -LDAPFilter '(&(servicePrincipalName=*)(!(objectClass=computer)))' -Properties servicePrincipalName,PasswordLastSet,Enabled -ErrorAction Stop
+      $result = New-Object System.Collections.Generic.List[object]
+      foreach ($u in $users) {
+        if ($u.samAccountName -eq 'krbtgt') { continue }
+        $result.Add(@{
+          sam          = [string]$u.samAccountName
+          spns         = @($u.servicePrincipalName | Sort-Object -Unique)
+          enabled      = [bool]$u.Enabled
+          pwd_last_set = (ConvertTo-IsoUtc $u.PasswordLastSet)
+        })
+      }
+      $Ansible.Result = @($result)
+  register: ad_kerberoastable_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_kerberoastable result / status
+  ansible.builtin.set_fact:
+    ad_kerberoastable_items: "{{ ad_kerberoastable_reg.result | default([]) if ad_kerberoastable_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_kerberoastable'] if ad_kerberoastable_reg is failed else []) }}"

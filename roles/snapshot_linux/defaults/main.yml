@@ -1,0 +1,103 @@
+---
+# roles/snapshot_linux/defaults/main.yml
+# Sane defaults for the read-only Linux snapshot collector. Every value here is
+# overridable from group_vars or the CLI's `-e` (see docs/CONTRACTS.md §1.5).
+# The role writes NOTHING to targets; the only write is the assembled snapshot
+# document, emitted with copy delegated to localhost.
+
+# --- Engagement / run identity (normally supplied by bin/driftwatch via -e) -----
+dw_engagement: "unknown-engagement"
+dw_engagement_dir: "/tmp/driftwatch/{{ dw_engagement }}"
+dw_run_id: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H%MZ') }}"
+dw_snapshot_dir: "{{ dw_engagement_dir }}/snapshots"
+
+# --- Collection depth / hashing policy ------------------------------------------
+# dw_deep gates the expensive categories (binary hashing, package inventory,
+# CA-bundle certificate enumeration, targeted file hashing).
+dw_deep: false
+# full | tiered | servers_only  — governs how aggressively on-disk binaries are hashed.
+dw_hash_policy: "tiered"
+
+# Convenience predicate: should we hash process/critical binaries this run?
+# 'full' always hashes; 'servers_only' and 'tiered' only when dw_deep is set.
+dw_snapshot_linux_do_hash: >-
+  {{ (dw_hash_policy == 'full') or (dw_deep | bool) }}
+
+# --- Per-category timeouts (seconds) — one hung command must not stall the run --
+dw_snapshot_linux_cmd_timeout: 60
+dw_snapshot_linux_hash_timeout: 300
+
+# --- Tunables -------------------------------------------------------------------
+# Ceiling on how many processes we resolve+hash, protecting very busy hosts.
+dw_snapshot_linux_max_procs: 4000
+
+# Standard search roots for the SUID/SGID inventory (L13). Kept deliberately small
+# and fixed for speed; full-filesystem FIM is out of scope (design §4.1 L13).
+dw_snapshot_linux_suid_paths:
+  - /usr
+  - /bin
+  - /sbin
+  - /opt
+  - /etc
+
+# Critical files whose content hash is tracked (L13). Fixed, small set.
+dw_snapshot_linux_critical_files:
+  - /etc/hosts
+  - /etc/resolv.conf
+  - /etc/nsswitch.conf
+  - /etc/passwd
+  - /etc/group
+  - /etc/sudoers
+  - /etc/ld.so.preload
+  - /etc/pam.d/system-auth
+  - /etc/pam.d/password-auth
+  - /etc/pam.d/sshd
+  - /etc/pam.d/su
+  - /etc/pam.d/sudo
+
+# Security-relevant sysctls captured for kernel_state (L11).
+dw_snapshot_linux_sysctls:
+  - net.ipv4.ip_forward
+  - net.ipv6.conf.all.forwarding
+  - kernel.kptr_restrict
+  - kernel.dmesg_restrict
+  - kernel.modules_disabled
+  - kernel.unprivileged_bpf_disabled
+  - kernel.yama.ptrace_scope
+  - kernel.randomize_va_space
+  - net.ipv4.conf.all.rp_filter
+  - net.ipv4.conf.all.accept_redirects
+  - net.ipv4.conf.all.send_redirects
+  - net.ipv4.tcp_syncookies
+
+# Shell rc / profile files tracked for the persistence category (L7). Service and
+# root account rc files are the interesting ones.
+dw_snapshot_linux_shell_rc_files:
+  - /root/.bashrc
+  - /root/.bash_profile
+  - /root/.profile
+  - /etc/bash.bashrc
+  - /etc/profile
+
+# `sshd -T` effective-setting subset recorded in ssh_config.effective (L9).
+# Keys are the lowercase names sshd -T prints. permit_root_login and
+# password_authentication are additionally lifted to top-level fields (§3.1).
+dw_snapshot_linux_sshd_t_keys:
+  - permitrootlogin
+  - passwordauthentication
+  - pubkeyauthentication
+  - kbdinteractiveauthentication
+  - challengeresponseauthentication
+  - permitemptypasswords
+  - usepam
+  - x11forwarding
+  - allowtcpforwarding
+  - allowagentforwarding
+  - permittunnel
+  - gatewayports
+  - port
+  - listenaddress
+  - authorizedkeysfile
+  - ciphers
+  - macs
+  - kexalgorithms

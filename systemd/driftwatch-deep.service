@@ -1,0 +1,31 @@
+[Unit]
+Description=driftwatch deep collection (hashing, package inventory, cert/trust stores, SUID scan)
+Documentation=file:///opt/driftwatch/systemd/README.md
+ConditionPathExists=/etc/driftwatch/engagement.env
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=driftwatch
+Group=driftwatch
+WorkingDirectory=/opt/driftwatch
+EnvironmentFile=/etc/driftwatch/engagement.env
+# --deep adds the expensive categories; the roles run hashing async with per-task timeouts,
+# so one slow host cannot stall the batch (design §8, Appendix C.2).
+ExecStart=/opt/driftwatch/bin/driftwatch collect --deep
+Nice=15
+IOSchedulingClass=idle
+# Hashing is the expensive part — give the deep run room to finish before the next window.
+TimeoutStartSec=14400
+
+# --- hardening -------------------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/opt/driftwatch/engagements
+
+[Install]
+WantedBy=multi-user.target

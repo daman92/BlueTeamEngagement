@@ -1,0 +1,72 @@
+---
+# diff_report.yml — the control-node pipeline: normalize -> diff -> report (design §6/§7).
+#
+# Pure localhost work, no target contact. This is the ansible-native equivalent of the
+# `driftwatch diff` + `driftwatch report` verbs; it exists so the pipeline can be driven
+# from Ansible (AWX/Semaphore parity, or a single playbook run after collection).
+#
+#   1. normalize.py  — raw snapshots -> canonical form (sort, volatile-strip, args_norm,
+#                      collector_self tagging). On-disk snapshots stay RAW and auditable.
+#   2. diff_engine.py — temporal / baseline / fleet-outlier / policy lenses -> findings NDJSON.
+#   3. report_gen.py  — findings NDJSON -> reports/<run_id>.{md,html}.
+#
+# Extra vars: dw_engagement_dir, dw_run_id (from bin/driftwatch). The scripts, rules, and
+# allowlists are resolved relative to the repo root.
+
+- name: Control-node diff & report pipeline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dw_repo_root: "{{ (playbook_dir ~ '/..') | realpath }}"
+    dw_scripts: "{{ dw_repo_root }}/scripts"
+    dw_rules: "{{ dw_repo_root }}/rules"
+    dw_allowlists: "{{ dw_repo_root }}/allowlists"
+    dw_report_format: "md,html"
+  tasks:
+    - name: Normalize raw snapshots into canonical form
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ dw_scripts }}/normalize.py"
+          - normalize
+          - --engagement-dir
+          - "{{ dw_engagement_dir }}"
+          - --run-id
+          - "{{ dw_run_id }}"
+      changed_when: true
+
+    - name: Run the diff engine (temporal/baseline/fleet/policy -> findings NDJSON)
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ dw_scripts }}/diff_engine.py"
+          - run
+          - --engagement-dir
+          - "{{ dw_engagement_dir }}"
+          - --run-id
+          - "{{ dw_run_id }}"
+          - --rules-dir
+          - "{{ dw_rules }}"
+          - --allowlists-dir
+          - "{{ dw_allowlists }}"
+      register: dw_diff
+      changed_when: true
+
+    - name: Render the Markdown + HTML report
+      ansible.builtin.command:
+        argv:
+          - python3
+          - "{{ dw_scripts }}/report_gen.py"
+          - render
+          - --engagement-dir
+          - "{{ dw_engagement_dir }}"
+          - --run-id
+          - "{{ dw_run_id }}"
+          - --format
+          - "{{ dw_report_format }}"
+      changed_when: true
+
+    - name: Diff engine summary
+      ansible.builtin.debug:
+        var: dw_diff.stdout_lines

@@ -1,0 +1,38 @@
+# driftwatch — group_vars for the `linux` group (design §3)
+# =============================================================================
+# Transport: SSH, with a scoped-sudo become. The collector account is a
+# dedicated svc-driftwatch whose sudo is restricted to the exact read commands
+# the snapshot_linux role runs (a sudoers command allowlist on the target — no
+# shell writes). Credentials come from the engagement vault by NAME; never place
+# plaintext here (design §15.3).
+# =============================================================================
+
+dw_platform: linux
+
+# --- connection --------------------------------------------------------------
+ansible_connection: ssh
+ansible_user: "{{ vault_linux_user | default('svc-driftwatch') }}"
+# Key-based auth preferred; fall back to a vault-held password only if the client
+# placed no key. Reference the vault variable, not the secret:
+# ansible_ssh_private_key_file: "{{ dw_engagement_dir }}/vault/linux_id"
+# ansible_password: "{{ vault_linux_password }}"
+
+# Strict host-key checking with a per-engagement known_hosts (design §9).
+ansible_ssh_common_args: >-
+  -o StrictHostKeyChecking=yes
+  -o UserKnownHostsFile={{ dw_engagement_dir }}/inventory/known_hosts
+  -o PreferredAuthentications=publickey,password
+  -o ConnectTimeout=15
+
+# Avoid the interpreter-discovery warning without writing to the target.
+ansible_python_interpreter: auto_silent
+
+# --- privilege ---------------------------------------------------------------
+# Read-only collection still needs sudo for /etc/shadow date fields, sudoers
+# hashes, nft ruleset, etc. — granted via a target-side command allowlist.
+ansible_become: true
+ansible_become_method: sudo
+# ansible_become_password: "{{ vault_linux_become_password }}"   # only if sudo needs a password
+
+# Sub-groups from the design inventory tree (rhel, debian) may add family-specific
+# vars (package manager query command, path differences) in their own group_vars.

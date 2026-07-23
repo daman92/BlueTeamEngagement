@@ -1,0 +1,16 @@
+[Unit]
+Description=driftwatch fast collection cadence (every 2h during an engagement)
+Documentation=file:///opt/driftwatch/systemd/README.md
+
+[Timer]
+# Tighter cadence buys more temporal-diff data points on a days-long engagement (design §8).
+# Scale via a drop-in (see README) to match scope.yml settings.fast_interval.
+OnCalendar=*-*-* 00/2:00:00
+RandomizedDelaySec=300
+AccuracySec=1min
+# Catch up a missed cycle if the kit was asleep/offline.
+Persistent=true
+Unit=driftwatch-fast.service
+
+[Install]
+WantedBy=timers.target

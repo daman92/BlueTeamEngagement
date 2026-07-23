@@ -1,0 +1,62 @@
+# driftwatch — argument / command-line normalization patterns (CONTRACTS.md §5;
+# design §6 "Args normalization")
+# =============================================================================
+# scripts/normalize.py applies these, IN ORDER, to the `args_norm` (linux) and
+# `cmdline_norm` (windows) fields before diffing. Whitespace is collapsed first,
+# then each pattern's `pattern` (a Python `re` regex, applied with re.sub) is
+# replaced by `replace`. The goal: strip one-time tokens (GUIDs, temp paths,
+# session ids, counters) so the SAME command does not diff as changed every run,
+# WITHOUT masking the parts that carry attacker signal.
+#
+# Order matters — narrower rules run before the broader ones they sit inside
+# (e.g. the AppData\Local\Temp rule precedes the generic C:\Users\<user> rule so
+# the temp path is collapsed before the user prefix is).
+#
+# WHAT IS DELIBERATELY *NOT* NORMALIZED: base64 blobs (PowerShell
+# -EncodedCommand payloads), hostnames, IPs, and flag names. Collapsing those
+# would erase exactly what the fileless / LOLBin policy checks key on.
+#
+# These override normalize.py's built-in defaults; keep them reviewed like code
+# (design §6). YAML scalars are single-quoted so backslashes are literal to the
+# regex engine (`\\` matches one backslash; `\.` matches a literal dot).
+# =============================================================================
+
+patterns:
+
+  # --- universal one-time identifiers ---------------------------------------
+  # GUID / UUID: MSI product codes, systemd-private-<guid>-*.mount units,
+  # COM CLSIDs, temp directory names, correlation ids.
+  - pattern: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+    replace: '<GUID>'
+
+  # --- windows temp / per-user paths ----------------------------------------
+  # Per-user temp: C:\Users\<name>\AppData\Local\Temp\<random>  (run BEFORE the
+  # generic Users prefix rule below).
+  - pattern: '(?i)[A-Z]:\\Users\\[^\\\s"]+\\AppData\\Local\\Temp\\[^\s"]*'
+    replace: '<TMPPATH>'
+  # System temp: C:\Windows\Temp\... and a bare C:\Temp\...
+  - pattern: '(?i)[A-Z]:\\(?:Windows\\Temp|Temp)\\[^\s"]*'
+    replace: '<TMPPATH>'
+  # Per-user profile prefix: collapse C:\Users\<name> so alice/bob diff equally.
+  - pattern: '(?i)[A-Z]:\\Users\\[^\\\s"]+'
+    replace: '<USERPROFILE>'
+  # ProgramData / local app-data version-stamped subdirs are stable enough to keep;
+  # only the volatile temp + user prefixes above are stripped.
+
+  # --- linux temp / per-user paths ------------------------------------------
+  # World-writable scratch dirs — the canonical malware drop locations.
+  - pattern: '(?:/tmp|/var/tmp|/dev/shm|/run/user/\d+)/[^\s"]+'
+    replace: '<TMPPATH>'
+  # Per-user home prefix: /home/<name> -> /home/<USER>.
+  - pattern: '/home/[^/\s"]+'
+    replace: '/home/<USER>'
+
+  # --- one-time tokens / counters -------------------------------------------
+  # Long hex blobs (>=32 hex): session tokens, handles, request ids, md5/sha
+  # values passed as arguments.
+  - pattern: '\b[0-9a-fA-F]{32,}\b'
+    replace: '<HEX>'
+  # Long decimal runs (>=6 digits): epoch timestamps, one-time numeric tokens,
+  # pids embedded in arguments.
+  - pattern: '\b\d{6,}\b'
+    replace: '<NUM>'

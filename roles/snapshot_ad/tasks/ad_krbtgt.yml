@@ -1,0 +1,36 @@
+---
+# tasks/ad_krbtgt.yml — CONTRACTS.md §3.3 ad_krbtgt (OBJECT category)
+# other: pwd_last_set, pwd_age_days
+#
+# The krbtgt account's password age — a reset (age dropping to ~0) is a Critical
+# signal (golden-ticket remediation, or an attacker forcing a reset). Object category:
+# the diff engine compares key-by-key.
+
+- name: Collect krbtgt password age (ad_krbtgt) via RSAT
+  ansible.windows.win_powershell:
+    script: |
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $k = Get-ADUser -Identity 'krbtgt' -Properties PasswordLastSet -ErrorAction Stop
+      $pls = $null
+      $age = $null
+      if ($k.PasswordLastSet) {
+        $utc = $k.PasswordLastSet.ToUniversalTime()
+        $pls = $utc.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $age = [int][math]::Floor(((Get-Date).ToUniversalTime() - $utc).TotalDays)
+      }
+      $Ansible.Result = @{
+        pwd_last_set = $pls
+        pwd_age_days = $age
+      }
+  register: ad_krbtgt_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_krbtgt result / status
+  ansible.builtin.set_fact:
+    ad_krbtgt_obj: "{{ ad_krbtgt_reg.result | default({}) if ad_krbtgt_reg is not failed else {} }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_krbtgt'] if ad_krbtgt_reg is failed else []) }}"

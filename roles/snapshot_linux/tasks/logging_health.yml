@@ -1,0 +1,67 @@
+---
+# tasks/logging_health.yml — L17 logging health (CONTRACTS §3.1 `logging_health`)
+# object category — fields: rsyslog_active, journald_forward, auditd_active,
+#                           audit_rules_hash, forward_targets (list)
+#
+# Attackers blind you first (design L17): rsyslog/auditd service state, journald
+# ForwardToSyslog, one hash over the loaded audit rule set, and the rsyslog
+# remote-forwarding targets (@/@@ legacy actions and omfwd target="..."). Records:
+#   rsyslog_active|auditd_active|journald_forward | true/false
+#   audit_rules_hash | <sha256>   ·   forward_target | <target>   (repeated)
+
+- name: L17 collect logging and audit health (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    ra=false; aa=false
+    if command -v systemctl >/dev/null 2>&1; then
+      [ "$(systemctl is-active rsyslog 2>/dev/null)" = "active" ] && ra=true
+      [ "$(systemctl is-active auditd 2>/dev/null)" = "active" ] && aa=true
+    fi
+    printf '%s\n' "rsyslog_active$US$ra"
+    printf '%s\n' "auditd_active$US$aa"
+
+    jf=false
+    for jc in /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf; do
+      [ -f "$jc" ] || continue
+      if grep -qiE '^[[:space:]]*ForwardToSyslog[[:space:]]*=[[:space:]]*(yes|true|1)' "$jc" 2>/dev/null; then
+        jf=true
+      fi
+    done
+    printf '%s\n' "journald_forward$US$jf"
+
+    arh=""
+    files=$(ls /etc/audit/rules.d/*.rules /etc/audit/audit.rules 2>/dev/null | LC_ALL=C sort -u)
+    if [ -n "$files" ]; then
+      arh=$(cat $files 2>/dev/null | sha256sum | awk '{print $1}')
+    fi
+    printf '%s\n' "audit_rules_hash$US$arh"
+
+    for rc in /etc/rsyslog.conf /etc/rsyslog.d/*.conf; do
+      [ -f "$rc" ] || continue
+      grep -hE '^[^#]*@' "$rc" 2>/dev/null | grep -oE '@@?[^ ;"]+' | while IFS= read -r t; do
+        printf '%s\n' "forward_target$US$t"
+      done
+      grep -hoiE 'target="[^"]+"' "$rc" 2>/dev/null | while IFS= read -r t; do
+        tt=$(printf '%s' "$t" | sed 's/^[Tt]arget="//; s/"$//')
+        printf '%s\n' "forward_target$US$tt"
+      done
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_loghealth
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L17 stash logging health records
+  ansible.builtin.set_fact:
+    dw_raw_logging_health: "{{ dw_loghealth.stdout | default('') }}"
+
+- name: L17 mark logging_health failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['logging_health'] }}"
+  when: (dw_loghealth.rc | default(1)) != 0

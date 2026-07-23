@@ -1,0 +1,197 @@
+---
+# =============================================================================
+# Tier-1 response play · block_hash   (design §13.3 / §13.4 / §13.6)
+#
+# Reversible containment: block a file by its SHA-256 across the endpoint's control
+# point — the EDR block-list where one exists (the natural home, and safe to apply
+# fleet-wide per §13.3 "contain fleet-wide, eradicate per-host"), with a Windows-native
+# AppLocker hash deny-rule as the fallback. The binary is NOT purged: blocking a hash
+# buys time while the dropped file itself is preserved as evidence for later analysis.
+#
+# Mandatory pattern (design §13.2): PRESERVE the current block-list state before the
+# change; the ACT task honours --check; the play refuses to mutate without dw_authorized;
+# serial: 1 canary; any_errors_fatal halts on first failure; dw_rollback removes the
+# block entry (unblocks the hash).
+# =============================================================================
+
+- name: "Tier-1 · block_hash (reversible EDR / AppLocker hash block)"
+  hosts: "{{ dw_target_hosts | mandatory }}"
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  # dw_case_id, dw_block_hash, dw_platform, dw_evidence_dir, dw_audit_log,
+  # dw_authorized and dw_rollback arrive as extra-vars from respond.py. They are
+  # deliberately NOT re-declared under vars: — a play var of the form
+  # dw_x: "{{ dw_x | default(...) }}" is a fatal recursive template in Ansible.
+  # The GATE below asserts their presence instead.
+  vars:
+    dw_tier: 1
+    dw_reversible: true
+    # EDR block-list API (empty = no EDR reachable; fall back to AppLocker on
+    # Windows). Literal defaults; override with -e when the engagement has an EDR.
+    dw_edr_api: ""
+    dw_edr_token_var: "vault_edr_token"
+
+  pre_tasks:
+    - name: "GATE · required dw_* extra-vars are present (passed by respond.py)"
+      ansible.builtin.assert:
+        that:
+          - dw_case_id is defined
+          - dw_block_hash is defined
+          - dw_platform is defined
+          - dw_evidence_dir is defined
+          - dw_audit_log is defined
+          - dw_authorized is defined
+          - dw_rollback is defined
+        fail_msg: >-
+          Missing required dw_* extra-vars. This play is invoked by
+          response/scripts/respond.py, which supplies them with -e; do not run it
+          by hand without providing the full set.
+
+    - name: "GATE · refuse to change anything without an approved case"
+      ansible.builtin.assert:
+        that:
+          - "dw_authorized | bool"
+        fail_msg: >-
+          Case {{ dw_case_id }} is not approved. Run `respond approve --case
+          {{ dw_case_id }}` first. (Dry runs with --check skip this gate.)
+      when: not ansible_check_mode
+
+    - name: "GATE · SHA-256 must be well-formed before we block on it"
+      ansible.builtin.assert:
+        that:
+          - "dw_block_hash | regex_search('^[0-9a-fA-F]{64}$')"
+        fail_msg: "dw_block_hash is not a 64-hex SHA-256: {{ dw_block_hash }}"
+
+  tasks:
+    # ---- PRESERVE (read-only, always runs, even in --check) -----------------
+    - name: "PRESERVE · record the current block-list entry for this hash (EDR)"
+      ansible.builtin.uri:
+        url: "{{ dw_edr_api }}/blocklist/{{ dw_block_hash }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ lookup('ansible.builtin.vars', dw_edr_token_var, default='') }}"
+        status_code: [200, 404]
+      register: dw_before_edr
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: dw_edr_api | length > 0
+
+    - name: "PRESERVE · write before-state to the evidence store (control node)"
+      ansible.builtin.copy:
+        dest: "{{ dw_evidence_dir }}/{{ inventory_hostname }}.blocklist_before.json"
+        content: >-
+          {{ {'host': inventory_hostname, 'sha256': dw_block_hash,
+              'edr_present': (dw_edr_api | length > 0),
+              'existing': (dw_before_edr.json | default('none'))} | to_nice_json }}
+      delegate_to: localhost
+      check_mode: false
+
+    # ---- ACT (contain) ------------------------------------------------------
+    - name: "ACT · add hash to EDR block-list — honours --check"
+      ansible.builtin.uri:
+        url: "{{ dw_edr_api }}/blocklist"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ lookup('ansible.builtin.vars', dw_edr_token_var, default='') }}"
+        body_format: json
+        body:
+          sha256: "{{ dw_block_hash }}"
+          action: block
+          reason: "driftwatch case {{ dw_case_id }}"
+        status_code: [200, 201]
+      register: dw_act_edr
+      when:
+        - not (dw_rollback | bool)
+        - dw_edr_api | length > 0
+
+    - name: "ACT · AppLocker hash deny-rule fallback (Windows, no EDR) — honours --check"
+      ansible.windows.win_powershell:
+        script: |
+          # Native fallback where no EDR block API is available: an AppLocker Exe
+          # file-hash Deny rule for the exact SHA-256, denied for Everyone
+          # (S-1-1-0). Merged into the local policy so existing rules are kept;
+          # reversible by removing this named rule (see the ROLLBACK task).
+          $ErrorActionPreference = 'Stop'
+          $rid  = 'driftwatch-{{ dw_case_id }}'
+          $hex  = '{{ dw_block_hash }}'
+          $guid = [guid]::NewGuid().ToString()
+          $policy = @"
+          <AppLockerPolicy Version="1">
+            <RuleCollection Type="Exe" EnforcementMode="Enabled">
+              <FileHashRule Id="$guid" Name="$rid" Description="driftwatch case {{ dw_case_id }} hash block" UserOrGroupSid="S-1-1-0" Action="Deny">
+                <Conditions>
+                  <FileHashCondition>
+                    <FileHash Type="SHA256" Data="0x$hex" SourceFileName="driftwatch-blocked.exe" SourceFileLength="1" />
+                  </FileHashCondition>
+                </Conditions>
+              </FileHashRule>
+            </RuleCollection>
+          </AppLockerPolicy>
+          "@
+          $tmp = New-TemporaryFile
+          Set-Content -LiteralPath $tmp.FullName -Value $policy -Encoding UTF8
+          Set-AppLockerPolicy -XmlPolicy $tmp.FullName -Merge
+          Remove-Item -LiteralPath $tmp.FullName -Force
+          Write-Output "applocker-deny-added rule=$rid sha256=$hex"
+      register: dw_act_applocker
+      when:
+        - not (dw_rollback | bool)
+        - dw_edr_api | length == 0
+        - dw_platform == 'windows'
+        # win_powershell runs its script even in check mode, so guard the WRITE:
+        # a `propose --check` dry run must make no target-changing contact (§14).
+        - not ansible_check_mode
+
+    # ---- ROLLBACK (unblock the hash) ----------------------------------------
+    - name: "ROLLBACK · remove hash from EDR block-list"
+      ansible.builtin.uri:
+        url: "{{ dw_edr_api }}/blocklist/{{ dw_block_hash }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ lookup('ansible.builtin.vars', dw_edr_token_var, default='') }}"
+        status_code: [200, 204, 404]
+      when:
+        - dw_rollback | bool
+        - dw_edr_api | length > 0
+
+    - name: "ROLLBACK · remove AppLocker hash deny-rule (Windows)"
+      ansible.windows.win_powershell:
+        script: |
+          # Rebuild the local AppLocker policy without our named deny rule and set
+          # it (overwrite), unblocking the hash. Idempotent: count=0 if absent.
+          $ErrorActionPreference = 'Stop'
+          $rid = 'driftwatch-{{ dw_case_id }}'
+          [xml]$doc = (Get-AppLockerPolicy -Local).ToXml()
+          $removed = 0
+          foreach ($rc in @($doc.AppLockerPolicy.RuleCollection)) {
+            foreach ($r in @($rc.SelectNodes('FileHashRule'))) {
+              if ($r.Name -eq $rid) { [void]$rc.RemoveChild($r); $removed++ }
+            }
+          }
+          $tmp = New-TemporaryFile
+          Set-Content -LiteralPath $tmp.FullName -Value $doc.OuterXml -Encoding UTF8
+          Set-AppLockerPolicy -XmlPolicy $tmp.FullName
+          Remove-Item -LiteralPath $tmp.FullName -Force
+          Write-Output "applocker-deny-removed rule=$rid count=$removed"
+      when:
+        - dw_rollback | bool
+        - dw_edr_api | length == 0
+        - dw_platform == 'windows'
+
+  post_tasks:
+    - name: "LOG · append this play's action to the append-only audit log"
+      ansible.builtin.lineinfile:
+        path: "{{ dw_audit_log }}"
+        create: true
+        insertafter: EOF
+        line: >-
+          {{ now(true, '%Y-%m-%dT%H:%M:%SZ') }} | play=block_hash |
+          case={{ dw_case_id }} | host={{ inventory_hostname }} |
+          sha256={{ dw_block_hash }} |
+          action={{ 'rollback' if (dw_rollback | bool) else 'block' }} |
+          via={{ 'edr' if (dw_edr_api | length > 0) else 'applocker' }} | outcome=ok
+      delegate_to: localhost
+      check_mode: false
+      when: not ansible_check_mode

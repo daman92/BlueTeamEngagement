@@ -1,0 +1,136 @@
+---
+# tasks/ldap_fallback.yml
+#
+# RSAT ActiveDirectory module absent on the delegated host — collect what can be
+# collected faithfully over LDAP with community.general.ldap_search (runs on the
+# control node), and record the rest as coverage gaps.
+#
+# WHY THIS IS PARTIAL: several ad categories depend on capabilities that are RSAT-only
+# in practice and cannot be reproduced in a control-node Jinja transform without a
+# custom filter — binary objectSid decoding (ad_admins, ad_delegation, ad_dcsync),
+# Windows FILETIME conversion (ad_krbtgt age), nTSecurityDescriptor / SDDL ACL hashing
+# (ad_dcsync, ad_adminsdholder), and full recursive group expansion with path tracking
+# (ad_privileged_groups). Those are marked in meta.failed_categories so the snapshot is
+# honestly labelled `partial` rather than silently thin. INSTALL RSAT-AD-PowerShell on
+# the delegated host for full-fidelity AD enrichment.
+#
+# NOTE (CONTRACTS.md §1.5): a failed category never fails the play. If the fallback is
+# not configured at all, EVERY ad category is recorded as failed and the snapshot is
+# still assembled and written (partial: true) — never a hard abort with no document.
+
+- name: Determine whether the LDAP fallback is configured
+  ansible.builtin.set_fact:
+    ad_ldap_configured: "{{ (dw_ad_ldap_server | length > 0) and (ad_domain_dn | length > 0) }}"
+
+- name: Warn that no AD collection path is available (RSAT absent, LDAP unconfigured)
+  ansible.builtin.debug:
+    msg: >-
+      RSAT ActiveDirectory module is absent on the delegated host and the LDAP fallback
+      is not configured. Recording every ad category as failed; the snapshot will be
+      written marked partial. Either install RSAT-AD-PowerShell on the delegated host
+      (recommended — full fidelity) or set dw_ad_ldap_server, dw_ad_domain_dn, and
+      dw_ad_ldap_bind_dn/dw_ad_ldap_bind_pw (bind_pw from the engagement vault).
+  when: not (ad_ldap_configured | bool)
+
+- name: Record every ad category as failed (no collection path available)
+  ansible.builtin.set_fact:
+    dw_ad_failed_categories: >-
+      {{ dw_ad_failed_categories + [
+           'ad_admins', 'ad_privileged_groups', 'ad_gpos', 'ad_dcsync',
+           'ad_delegation', 'ad_kerberoastable', 'ad_krbtgt', 'ad_adminsdholder'] }}
+  when: not (ad_ldap_configured | bool)
+
+# --- ad_kerberoastable (identity: sam) — cleanly derivable over LDAP -----------------
+- name: Enumerate Kerberoastable accounts over LDAP
+  community.general.ldap_search:
+    dn: "{{ ad_domain_dn }}"
+    scope: subordinate
+    filter: "(&(objectClass=user)(objectCategory=person)(servicePrincipalName=*))"
+    attrs:
+      - sAMAccountName
+      - servicePrincipalName
+    server_uri: "ldap://{{ dw_ad_ldap_server }}"
+    bind_dn: "{{ dw_ad_ldap_bind_dn }}"
+    bind_pw: "{{ dw_ad_ldap_bind_pw }}"
+  delegate_to: localhost
+  register: ad_krb_ldap
+  ignore_errors: true
+  no_log: true
+  when: ad_ldap_configured | bool
+
+- name: Shape Kerberoastable results (LDAP, reduced fidelity)
+  ansible.builtin.set_fact:
+    ad_kerberoastable_items: >-
+      {{ ad_kerberoastable_items + [{
+           'sam': item.sAMAccountName,
+           'spns': ([item.servicePrincipalName | default([])] | ansible.builtin.flatten | sort),
+           'enabled': None,
+           'pwd_last_set': None
+         }] }}
+  loop: "{{ (ad_krb_ldap.results | default([])) | rejectattr('sAMAccountName', 'equalto', 'krbtgt') | list }}"
+  loop_control:
+    label: "{{ item.sAMAccountName | default('?') }}"
+  when:
+    - ad_ldap_configured | bool
+    - ad_krb_ldap is not failed
+
+# --- ad_gpos (identity: guid) — basic fields derivable over LDAP --------------------
+- name: Enumerate GPOs over LDAP
+  community.general.ldap_search:
+    dn: "CN=Policies,CN=System,{{ ad_domain_dn }}"
+    scope: subordinate
+    filter: "(objectClass=groupPolicyContainer)"
+    attrs:
+      - name
+      - displayName
+      - versionNumber
+      - gPCFileSysPath
+    server_uri: "ldap://{{ dw_ad_ldap_server }}"
+    bind_dn: "{{ dw_ad_ldap_bind_dn }}"
+    bind_pw: "{{ dw_ad_ldap_bind_pw }}"
+  delegate_to: localhost
+  register: ad_gpo_ldap
+  ignore_errors: true
+  no_log: true
+  when: ad_ldap_configured | bool
+
+- name: Shape GPO results (LDAP, basic — no SYSVOL scripts/tasks or link map)
+  ansible.builtin.set_fact:
+    ad_gpos_items: >-
+      {{ ad_gpos_items + [{
+           'guid': (item.name | regex_replace('[{}]', '') | lower),
+           'name': (item.displayName | default('')),
+           'version': (item.versionNumber | default(0) | int),
+           'path_hash': ((item.gPCFileSysPath | default('')) | hash('sha256')),
+           'linked_ous': [],
+           'startup_scripts': [],
+           'linked_tasks': []
+         }] }}
+  loop: "{{ ad_gpo_ldap.results | default([]) }}"
+  loop_control:
+    label: "{{ item.name | default('?') }}"
+  when:
+    - ad_ldap_configured | bool
+    - ad_gpo_ldap is not failed
+
+# --- Record everything the LDAP fallback cannot faithfully produce ------------------
+- name: Record RSAT-only categories as coverage gaps
+  ansible.builtin.set_fact:
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + ldap_unsupported }}"
+  vars:
+    ldap_unsupported:
+      - ad_admins
+      - ad_privileged_groups
+      - ad_dcsync
+      - ad_delegation
+      - ad_krbtgt
+      - ad_adminsdholder
+  when: ad_ldap_configured | bool
+
+- name: Record failed LDAP category queries
+  ansible.builtin.set_fact:
+    dw_ad_failed_categories: >-
+      {{ dw_ad_failed_categories
+         + (['ad_kerberoastable'] if ad_krb_ldap is failed else [])
+         + (['ad_gpos'] if ad_gpo_ldap is failed else []) }}
+  when: ad_ldap_configured | bool

@@ -1,0 +1,33 @@
+---
+# W15 shares (CONTRACTS §3.2 `shares`)
+# identity: name | other: path, acl (sorted list of "principal:right" strings)
+
+- name: "W15 shares"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = foreach ($sh in (Get-SmbShare -ErrorAction SilentlyContinue)) {
+        $acl = @()
+        try {
+          foreach ($a in (Get-SmbShareAccess -Name $sh.Name -ErrorAction SilentlyContinue)) {
+            $acl += "$($a.AccountName):$($a.AccessRight)"
+          }
+        } catch {}
+        [ordered]@{
+          name = $sh.Name
+          path = $sh.Path
+          acl  = @($acl | Sort-Object -Unique)
+        }
+      }
+      $out
+  register: reg_shares
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record shares collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['shares'] }}"
+  when: reg_shares is failed

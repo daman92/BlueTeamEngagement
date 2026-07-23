@@ -1,0 +1,91 @@
+---
+# tasks/ad_delegation.yml — CONTRACTS.md §3.3 ad_delegation
+# identity: kind, sid | other: sam, targets (sorted)
+# kind: unconstrained | constrained | rbcd
+#
+# Kerberos delegation surface (W18):
+#   unconstrained -> TRUSTED_FOR_DELEGATION UAC bit (targets = any service; empty list)
+#   constrained   -> msDS-AllowedToDelegateTo populated (targets = the allowed SPNs)
+#   rbcd          -> msDS-AllowedToActOnBehalfOfOtherIdentity populated
+#                    (targets = principals allowed to act on behalf of this object)
+
+- name: Collect delegation settings (ad_delegation) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      DomainDN: "{{ ad_domain_dn }}"
+    script: |
+      param(
+        [string]$DomainDN
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $result = New-Object System.Collections.Generic.List[object]
+
+      # Unconstrained delegation: TRUSTED_FOR_DELEGATION (0x80000 = 524288).
+      $unconstrained = Get-ADObject -SearchBase $DomainDN -LDAPFilter '(userAccountControl:1.2.840.113556.1.4.803:=524288)' -Properties objectSid,samAccountName -ErrorAction SilentlyContinue
+      foreach ($o in $unconstrained) {
+        if (-not $o.objectSid) { continue }
+        $result.Add(@{
+          kind    = 'unconstrained'
+          sid     = [string]$o.objectSid.Value
+          sam     = [string]$o.samAccountName
+          targets = @()
+        })
+      }
+
+      # Constrained delegation (incl. protocol transition): msDS-AllowedToDelegateTo set.
+      $constrained = Get-ADObject -SearchBase $DomainDN -LDAPFilter '(msDS-AllowedToDelegateTo=*)' -Properties objectSid,samAccountName,msDS-AllowedToDelegateTo -ErrorAction SilentlyContinue
+      foreach ($o in $constrained) {
+        if (-not $o.objectSid) { continue }
+        $targets = @($o.'msDS-AllowedToDelegateTo' | Sort-Object -Unique)
+        $result.Add(@{
+          kind    = 'constrained'
+          sid     = [string]$o.objectSid.Value
+          sam     = [string]$o.samAccountName
+          targets = @($targets)
+        })
+      }
+
+      # Resource-based constrained delegation (RBCD): msDS-AllowedToActOnBehalfOfOtherIdentity.
+      $rbcd = Get-ADObject -SearchBase $DomainDN -LDAPFilter '(msDS-AllowedToActOnBehalfOfOtherIdentity=*)' -Properties objectSid,samAccountName,msDS-AllowedToActOnBehalfOfOtherIdentity -ErrorAction SilentlyContinue
+      foreach ($o in $rbcd) {
+        if (-not $o.objectSid) { continue }
+        $targets = New-Object System.Collections.Generic.List[string]
+        try {
+          $raw = $o.'msDS-AllowedToActOnBehalfOfOtherIdentity'
+          if ($raw) {
+            $sd = New-Object System.DirectoryServices.ActiveDirectorySecurity
+            $sd.SetSecurityDescriptorBinaryForm([byte[]]$raw)
+            foreach ($rule in $sd.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+              $psid = [string]$rule.IdentityReference.Value
+              $pname = $psid
+              # Get-ADObject -Identity accepts only DN/GUID, never a SID string — resolve
+              # the SID via an LDAP filter (falls back to the raw SID on any failure).
+              try {
+                $po = Get-ADObject -LDAPFilter "(objectSid=$psid)" -Properties samAccountName -ErrorAction Stop |
+                        Select-Object -First 1
+                if ($po -and $po.samAccountName) { $pname = [string]$po.samAccountName }
+              } catch { }
+              $targets.Add($pname)
+            }
+          }
+        } catch { }
+        $result.Add(@{
+          kind    = 'rbcd'
+          sid     = [string]$o.objectSid.Value
+          sam     = [string]$o.samAccountName
+          targets = @($targets | Sort-Object -Unique)
+        })
+      }
+      $Ansible.Result = @($result)
+  register: ad_delegation_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_delegation result / status
+  ansible.builtin.set_fact:
+    ad_delegation_items: "{{ ad_delegation_reg.result | default([]) if ad_delegation_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_delegation'] if ad_delegation_reg is failed else []) }}"

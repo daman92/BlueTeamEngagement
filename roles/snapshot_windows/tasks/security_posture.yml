@@ -1,0 +1,64 @@
+---
+# W17 security_posture (CONTRACTS §3.2 `security_posture`, OBJECT category)
+# fields: wdigest_uselogoncredential, lsa_runasppl, rdp_enabled, rdp_nla, smbv1_enabled,
+#         defender_enabled, defender_exclusions (sorted list)
+#
+# Defender exclusions are a favourite attacker move (design W17) — any new exclusion is a
+# High finding, so the full exclusion set is collected and sorted.
+
+- name: "W17 security posture"
+  ansible.windows.win_powershell:
+    depth: 6
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      function Get-RegVal($path, $name) {
+        try { return (Get-ItemProperty -Path $path -Name $name -ErrorAction Stop).$name } catch { return $null }
+      }
+
+      $wdigest  = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest' 'UseLogonCredential'
+      $runasppl = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'RunAsPPL'
+
+      $fdeny = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections'
+      $rdpEnabled = $false
+      if ($null -ne $fdeny) { $rdpEnabled = ([int]$fdeny -eq 0) }
+
+      $nla = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' 'UserAuthentication'
+      $rdpNla = $false
+      if ($null -ne $nla) { $rdpNla = ([int]$nla -eq 1) }
+
+      $smb1 = $null
+      try { $smb1 = [bool](Get-SmbServerConfiguration -ErrorAction Stop).EnableSMB1Protocol }
+      catch {
+        $v = Get-RegVal 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1'
+        if ($null -ne $v) { $smb1 = ([int]$v -eq 1) }
+      }
+
+      $defEnabled = $null
+      try { $defEnabled = [bool](Get-MpComputerStatus -ErrorAction Stop).AntivirusEnabled } catch {}
+
+      $excl = @()
+      try {
+        $mp = Get-MpPreference -ErrorAction Stop
+        $excl = @($mp.ExclusionPath) + @($mp.ExclusionProcess) + @($mp.ExclusionExtension) + @($mp.ExclusionIpAddress)
+        $excl = @($excl | Where-Object { $_ } | Sort-Object -Unique)
+      } catch {}
+
+      [ordered]@{
+        wdigest_uselogoncredential = $(if ($null -ne $wdigest) { [int]$wdigest } else { $null })
+        lsa_runasppl              = $(if ($null -ne $runasppl) { [int]$runasppl } else { $null })
+        rdp_enabled               = [bool]$rdpEnabled
+        rdp_nla                   = [bool]$rdpNla
+        smbv1_enabled             = $smb1
+        defender_enabled          = $defEnabled
+        defender_exclusions       = @($excl)
+      }
+  register: reg_security_posture
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record security_posture collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['security_posture'] }}"
+  when: reg_security_posture is failed

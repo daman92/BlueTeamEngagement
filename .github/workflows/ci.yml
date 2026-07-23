@@ -1,0 +1,50 @@
+name: driftwatch-ci
+
+# The read-only lint is a SECURITY control (design §9, §15.3), not a style check: with a
+# single shared privileged account the collector's safety is "does not write", and this
+# job is what enforces it. A lint failure fails the build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  readonly-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml
+      - name: Enforce read-only collector roles
+        run: python scripts/lint_readonly.py check --roles-dir roles
+
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pyyaml jinja2 pytest
+      - name: Unit tests (engine + scripts)
+        run: python -m pytest tests/ -q
+
+  ansible-lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # advisory until ansible-lint config is tuned per kit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "ansible-core>=2.16" ansible-lint
+      - name: Syntax-check playbooks
+        run: |
+          for pb in playbooks/*.yml response/playbooks/*.yml; do
+            echo "== $pb =="
+            ansible-playbook --syntax-check "$pb" || true
+          done
+      - run: ansible-lint playbooks/ roles/ || true

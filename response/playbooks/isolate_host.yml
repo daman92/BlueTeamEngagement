@@ -1,0 +1,188 @@
+---
+# =============================================================================
+# Tier-1 response play · isolate_host   (design §13.3 / §13.4 / §13.6)
+#
+# Reversible containment: quarantine the host by applying deny-all-except-management
+# rules to the HOST's own firewall — buying time without destroying state.
+#
+# WHY HOST-FIREWALL AND NOT A QUARANTINE VLAN: moving a port to a quarantine VLAN is a
+# switch-config write, and v1 ships NO network-config-writing play (design §13.5 — those
+# need in-band-path warnings and mandatory rollback timers this version does not carry).
+# Host-firewall isolation reaches the same containment on the endpoint itself and is
+# trivially reversible. The VLAN route is left as a documented future network play.
+#
+# Mandatory pattern (design §13.2): PRESERVE the current ruleset before any change;
+# the ACT task honours --check; the play refuses to mutate without dw_authorized;
+# serial: 1 canary; any_errors_fatal halts on first failure; dw_rollback removes the
+# quarantine rules and restores connectivity.
+#
+# A management allow-list (dw_mgmt_cidrs) keeps the analyst's own path to the box open
+# so isolation does not also lock the responder out.
+# =============================================================================
+
+- name: "Tier-1 · isolate_host (reversible host-firewall quarantine)"
+  hosts: "{{ dw_target_hosts | mandatory }}"
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  # dw_case_id, dw_platform, dw_evidence_dir, dw_audit_log, dw_authorized and
+  # dw_rollback arrive as extra-vars from respond.py. They are deliberately NOT
+  # re-declared under vars: — a play var of the form dw_x: "{{ dw_x | default(...) }}"
+  # is a fatal recursive template in Ansible. The GATE below asserts their presence.
+  vars:
+    dw_tier: 1
+    dw_reversible: true
+    dw_quarantine_group: "driftwatch_quarantine"
+    # Management ranges kept reachable so the responder is not locked out.
+    # Literal default; override with -e dw_mgmt_cidrs='["10.10.0.0/24", ...]'.
+    dw_mgmt_cidrs: ["10.0.0.0/8"]
+
+  pre_tasks:
+    - name: "GATE · required dw_* extra-vars are present (passed by respond.py)"
+      ansible.builtin.assert:
+        that:
+          - dw_case_id is defined
+          - dw_platform is defined
+          - dw_evidence_dir is defined
+          - dw_audit_log is defined
+          - dw_authorized is defined
+          - dw_rollback is defined
+        fail_msg: >-
+          Missing required dw_* extra-vars. This play is invoked by
+          response/scripts/respond.py, which supplies them with -e; do not run it
+          by hand without providing the full set.
+
+    - name: "GATE · refuse to change anything without an approved case"
+      ansible.builtin.assert:
+        that:
+          - "dw_authorized | bool"
+        fail_msg: >-
+          Case {{ dw_case_id }} is not approved. Run `respond approve --case
+          {{ dw_case_id }}` first. (Dry runs with --check skip this gate.)
+      when: not ansible_check_mode
+
+  tasks:
+    # ---- PRESERVE (read-only, always runs, even in --check) -----------------
+    - name: "PRESERVE · capture current firewall ruleset (Windows)"
+      ansible.windows.win_powershell:
+        script: |
+          Get-NetFirewallProfile | Select-Object Name, Enabled,
+            DefaultInboundAction, DefaultOutboundAction | ConvertTo-Json -Depth 3
+      register: dw_before_win
+      check_mode: false
+      changed_when: false
+      when: dw_platform == 'windows'
+
+    - name: "PRESERVE · capture current firewall ruleset (Linux)"
+      ansible.builtin.command:
+        cmd: "nft list ruleset"
+      register: dw_before_linux
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: dw_platform != 'windows'
+
+    - name: "PRESERVE · write before-state to the evidence store (control node)"
+      ansible.builtin.copy:
+        dest: "{{ dw_evidence_dir }}/{{ inventory_hostname }}.firewall_before.txt"
+        content: >-
+          {{ dw_before_win.output | default(dw_before_linux.stdout) |
+             default('unknown') }}
+      delegate_to: localhost
+      check_mode: false
+
+    # ---- ACT (contain) ------------------------------------------------------
+    - name: "ACT · quarantine host firewall (Windows) — honours --check"
+      ansible.windows.win_powershell:
+        script: |
+          # Allow the responder's management ranges first, then deny everything else.
+          New-NetFirewallRule -DisplayName 'driftwatch-mgmt' `
+            -Group '{{ dw_quarantine_group }}' -Direction Inbound -Action Allow `
+            -RemoteAddress @('{{ dw_mgmt_cidrs | join("','") }}') -Enabled True | Out-Null
+          Set-NetFirewallProfile -All -DefaultInboundAction Block -DefaultOutboundAction Block
+      register: dw_act_win
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform == 'windows'
+        # win_powershell runs its script even in check mode (the module cannot
+        # infer intent), so guard the WRITE explicitly: a `propose --check` dry run
+        # must make no target-changing contact (design §14). The module/command
+        # tasks below auto-skip in check mode; win_powershell must be told.
+        - not ansible_check_mode
+
+    - name: "ACT · quarantine host firewall (Linux) — honours --check"
+      # Installs a complete, self-contained quarantine table. Hook priority -200
+      # evaluates ahead of typical rulesets, and in nftables a drop in ANY hook
+      # chain drops the packet — so this quarantines regardless of what the
+      # existing firewall allows. Loopback, established/related (keeps the
+      # responder's current session alive) and the management CIDRs stay open;
+      # everything else is dropped both directions. ROLLBACK deletes the table,
+      # restoring the pre-quarantine ruleset untouched. The delete-first makes
+      # a re-run idempotent (no duplicated rules from a partial earlier apply).
+      # shell/command tasks are skipped by Ansible in --check, so a dry run
+      # makes no target-changing contact.
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          nft delete table inet {{ dw_quarantine_group }} 2>/dev/null || true
+          nft -f - <<'DWNFT'
+          table inet {{ dw_quarantine_group }} {
+            chain input {
+              type filter hook input priority -200; policy drop;
+              iif "lo" accept
+              ct state established,related accept
+              ip saddr { {{ dw_mgmt_cidrs | join(', ') }} } accept
+            }
+            chain output {
+              type filter hook output priority -200; policy drop;
+              oif "lo" accept
+              ct state established,related accept
+              ip daddr { {{ dw_mgmt_cidrs | join(', ') }} } accept
+            }
+          }
+          DWNFT
+      register: dw_act_linux
+      changed_when: true
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform != 'windows'
+
+    # ---- ROLLBACK (lift the quarantine) -------------------------------------
+    - name: "ROLLBACK · remove quarantine rules and restore defaults (Windows)"
+      ansible.windows.win_powershell:
+        script: |
+          Get-NetFirewallRule -Group '{{ dw_quarantine_group }}' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+          # Return the profile defaults to NotConfigured (inherit GPO / OS default:
+          # inbound Block, outbound Allow) rather than forcing Allow/Allow, which
+          # would leave the host MORE exposed than before the quarantine. The exact
+          # pre-quarantine values are preserved in the evidence store
+          # (<host>.firewall_before.txt) if manual restoration is needed.
+          Set-NetFirewallProfile -All -DefaultInboundAction NotConfigured -DefaultOutboundAction NotConfigured
+      when:
+        - dw_rollback | bool
+        - dw_platform == 'windows'
+
+    - name: "ROLLBACK · remove quarantine table (Linux)"
+      ansible.builtin.command:
+        cmd: "nft delete table inet {{ dw_quarantine_group }}"
+      changed_when: true
+      failed_when: false
+      when:
+        - dw_rollback | bool
+        - dw_platform != 'windows'
+
+  post_tasks:
+    - name: "LOG · append this play's action to the append-only audit log"
+      ansible.builtin.lineinfile:
+        path: "{{ dw_audit_log }}"
+        create: true
+        insertafter: EOF
+        line: >-
+          {{ now(true, '%Y-%m-%dT%H:%M:%SZ') }} | play=isolate_host |
+          case={{ dw_case_id }} | host={{ inventory_hostname }} |
+          action={{ 'rollback' if (dw_rollback | bool) else 'quarantine' }} |
+          method=host_firewall | outcome=ok
+      delegate_to: localhost
+      check_mode: false
+      when: not ansible_check_mode

@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: snapshot_windows
+  namespace: driftwatch
+  author: driftwatch
+  description: >-
+    Read-only Windows security snapshot collector for driftwatch (design §4.2,
+    categories W1-W17). Emits one canonical JSON document per host per run,
+    assembled on the control node; writes nothing to targets.
+  company: driftwatch
+  license: MIT
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Windows
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - blueteam
+    - windows
+    - drift
+    - baseline
+    - readonly
+
+# This is a collector role: it depends on no other roles. The Ansible collections it
+# uses (ansible.windows) are declared in the kit-level requirements.yml, not here.
+dependencies: []

@@ -1,0 +1,99 @@
+---
+# tasks/ad_gpos.yml — CONTRACTS.md §3.3 ad_gpos
+# identity: guid
+# other: name, version, path_hash, linked_ous (sorted), startup_scripts (sorted),
+#        linked_tasks (sorted)
+#
+# GPO inventory + AD-integrated persistence surface (W18). guid/name/version/path_hash
+# and linked_ous come straight from AD (cheap). startup_scripts + linked_tasks require
+# reading SYSVOL and are gated behind dw_deep (expensive file I/O over the SYSVOL share).
+
+- name: Collect GPO inventory + persistence surface (ad_gpos) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      DomainDN: "{{ ad_domain_dn }}"
+      CollectSysvol: "{{ dw_deep | bool }}"
+    script: |
+      param(
+        [string]$DomainDN,
+        [bool]$CollectSysvol
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      $sha = [System.Security.Cryptography.SHA256]::Create()
+      function Get-Sha256Hex($s) {
+        if ($null -eq $s) { $s = '' }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$s)
+        return ([System.BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLower()
+      }
+
+      $policiesBase = "CN=Policies,CN=System,$DomainDN"
+      $gpos = Get-ADObject -SearchBase $policiesBase -LDAPFilter '(objectClass=groupPolicyContainer)' -Properties displayName,gPCFileSysPath,versionNumber,name -ErrorAction Stop
+
+      # Build a GUID -> [linked container DNs] map from every gPLink in the domain.
+      $linkMap = @{}
+      $linked = Get-ADObject -SearchBase $DomainDN -LDAPFilter '(gPLink=*)' -Properties gPLink,distinguishedName -ErrorAction SilentlyContinue
+      foreach ($container in $linked) {
+        if (-not $container.gPLink) { continue }
+        foreach ($match in [regex]::Matches([string]$container.gPLink, '\{[0-9A-Fa-f\-]{36}\}')) {
+          $key = $match.Value.ToLower()
+          if (-not $linkMap.ContainsKey($key)) { $linkMap[$key] = New-Object System.Collections.Generic.List[string] }
+          $linkMap[$key].Add([string]$container.distinguishedName)
+        }
+      }
+
+      $result = New-Object System.Collections.Generic.List[object]
+      foreach ($g in $gpos) {
+        $nameAttr = [string]$g.name
+        $guid = $nameAttr.Trim([char[]]('{','}')).ToLower()
+        $links = @()
+        if ($linkMap.ContainsKey($nameAttr.ToLower())) { $links = @($linkMap[$nameAttr.ToLower()] | Sort-Object -Unique) }
+
+        $startup = New-Object System.Collections.Generic.List[string]
+        $tasks = New-Object System.Collections.Generic.List[string]
+        if ($CollectSysvol -and $g.gPCFileSysPath) {
+          foreach ($scope in @('Machine','User')) {
+            foreach ($iniName in @('scripts.ini','psscripts.ini')) {
+              $iniPath = Join-Path -Path ([string]$g.gPCFileSysPath) -ChildPath ($scope + '\Scripts\' + $iniName)
+              if (Test-Path -LiteralPath $iniPath) {
+                try {
+                  Get-Content -LiteralPath $iniPath -ErrorAction Stop |
+                    Where-Object { $_ -match 'CmdLine\s*=' } |
+                    ForEach-Object { $startup.Add((($_ -replace '(?i).*cmdline\s*=\s*', '').Trim())) }
+                } catch { }
+              }
+            }
+            $stXml = Join-Path -Path ([string]$g.gPCFileSysPath) -ChildPath ($scope + '\Preferences\ScheduledTasks\ScheduledTasks.xml')
+            if (Test-Path -LiteralPath $stXml) {
+              try {
+                [xml]$doc = Get-Content -LiteralPath $stXml -Raw -ErrorAction Stop
+                foreach ($node in $doc.ScheduledTasks.ChildNodes) {
+                  if ($node.name) { $tasks.Add([string]$node.name) }
+                }
+              } catch { }
+            }
+          }
+        }
+
+        $result.Add(@{
+          guid            = $guid
+          name            = [string]$g.displayName
+          version         = [int]($g.versionNumber)
+          path_hash       = (Get-Sha256Hex ([string]$g.gPCFileSysPath))
+          linked_ous      = @($links)
+          startup_scripts = @($startup | Sort-Object -Unique)
+          linked_tasks    = @($tasks | Sort-Object -Unique)
+        })
+      }
+      $Ansible.Result = @($result)
+  register: ad_gpos_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_gpos result / status
+  ansible.builtin.set_fact:
+    ad_gpos_items: "{{ ad_gpos_reg.result | default([]) if ad_gpos_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_gpos'] if ad_gpos_reg is failed else []) }}"

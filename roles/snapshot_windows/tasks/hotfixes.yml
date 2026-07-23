@@ -1,0 +1,28 @@
+---
+# W11b hotfixes (CONTRACTS §3.2 `hotfixes`)
+# identity: hotfix_id | other: installed_on
+
+- name: "W11b hotfixes"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = foreach ($h in (Get-HotFix -ErrorAction SilentlyContinue)) {
+        $inst = $null
+        if ($h.InstalledOn) {
+          try { $inst = ([datetime]$h.InstalledOn).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+          catch { $inst = "$($h.InstalledOn)" }
+        }
+        [ordered]@{ hotfix_id = "$($h.HotFixID)"; installed_on = $inst }
+      }
+      $out
+  register: reg_hotfixes
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record hotfixes collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['hotfixes'] }}"
+  when: reg_hotfixes is failed

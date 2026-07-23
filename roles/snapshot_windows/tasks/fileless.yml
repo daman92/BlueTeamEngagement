@@ -1,0 +1,62 @@
+---
+# W2 fileless (CONTRACTS §3.2 `fileless`)
+# identity: indicator, detail | volatile: pid
+# indicator in {null_path, name_path_mismatch, lolbin_cmdline, encoded_powershell}
+#
+# Derived from the same Win32_Process view as W1 (re-queried so this task stays
+# self-contained and cheap — no hashing here). Honest limit (design W2): true in-memory
+# implants need EDR/memory scanning; these are tripwires, not proof.
+
+- name: "W2 fileless indicators"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $lolbins = @('rundll32.exe', 'regsvr32.exe', 'mshta.exe')
+      $ps = @('powershell.exe', 'pwsh.exe')
+      $out = New-Object System.Collections.ArrayList
+
+      foreach ($p in (Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+        $name = $p.Name
+        $path = $p.ExecutablePath
+        $cmd  = $p.CommandLine
+        $pidv = [int]$p.ProcessId
+        $nameLc = if ($name) { $name.ToLower() } else { '' }
+        $cmdNorm = if ($cmd) { ($cmd -replace '\s+', ' ').Trim() } else { '' }
+
+        # null_path: a live process with no on-disk image, excluding kernel pids 0/4.
+        if (-not $path -and $pidv -gt 4) {
+          [void]$out.Add([ordered]@{ indicator = 'null_path'; detail = $name; pid = $pidv })
+        }
+
+        # name_path_mismatch: the on-disk image filename differs from the process name.
+        if ($path -and $name) {
+          $leaf = Split-Path -Leaf $path
+          if ($leaf -and ($leaf -ne $name)) {
+            [void]$out.Add([ordered]@{ indicator = 'name_path_mismatch'; detail = "$name@$path"; pid = $pidv })
+          }
+        }
+
+        # lolbin_cmdline: a classic proxy-execution binary invoked with arguments.
+        if ($nameLc -and ($lolbins -contains $nameLc) -and $cmdNorm) {
+          [void]$out.Add([ordered]@{ indicator = 'lolbin_cmdline'; detail = "$nameLc : $cmdNorm"; pid = $pidv })
+        }
+
+        # encoded_powershell: powershell/pwsh launched with an encoded command.
+        if ($nameLc -and ($ps -contains $nameLc) -and $cmd) {
+          if ($cmd -match '(?i)\s[-/](encodedcommand|enc|ec|e)\b') {
+            [void]$out.Add([ordered]@{ indicator = 'encoded_powershell'; detail = "$nameLc encoded-command"; pid = $pidv })
+          }
+        }
+      }
+      $out
+  register: reg_fileless
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record fileless collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['fileless'] }}"
+  when: reg_fileless is failed

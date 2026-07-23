@@ -1,0 +1,78 @@
+---
+# W14 audit_logging (CONTRACTS §3.2 `audit_logging`, OBJECT category)
+# fields: audit_policy (dict), eventlog_running, max_log_sizes (dict), wef_configured,
+#         cleared_events (list of {event_id, time})
+#
+# 1102 (Security log cleared) / 104 (System log cleared) since the last snapshot is a
+# Critical signal (design W14) — attackers blind you first.
+
+- name: "W14 audit & logging health"
+  ansible.windows.win_powershell:
+    depth: 6
+    parameters:
+      EventScanMax: "{{ dw_event_scan_max }}"
+    script: |
+      param([int]$EventScanMax = 50)
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      # effective audit policy (auditpol CSV -> dict)
+      $auditPolicy = [ordered]@{}
+      try {
+        $csv = auditpol /get /category:* /r 2>$null
+        if ($csv) {
+          foreach ($row in ($csv | ConvertFrom-Csv)) {
+            $sub = $row.'Subcategory'
+            if ($sub) { $auditPolicy["$sub"] = "$($row.'Inclusion Setting')" }
+          }
+        }
+      } catch {}
+
+      $eventlogRunning = $false
+      try { $eventlogRunning = ((Get-Service -Name EventLog -ErrorAction Stop).Status -eq 'Running') } catch {}
+
+      $maxSizes = [ordered]@{}
+      foreach ($ln in @('Security', 'System', 'Application')) {
+        try {
+          $log = Get-WinEvent -ListLog $ln -ErrorAction Stop
+          if ($log) { $maxSizes["$ln"] = [int64]$log.MaximumSizeInBytes }
+        } catch {}
+      }
+
+      $wef = $false
+      try {
+        $sm = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager' -ErrorAction SilentlyContinue
+        if ($sm) {
+          foreach ($pp in $sm.PSObject.Properties) {
+            if ($pp.Name -notlike 'PS*' -and $pp.Value) { $wef = $true }
+          }
+        }
+      } catch {}
+
+      $cleared = New-Object System.Collections.ArrayList
+      foreach ($q in @(@{ log = 'Security'; id = 1102 }, @{ log = 'System'; id = 104 })) {
+        try {
+          $evts = Get-WinEvent -FilterHashtable @{ LogName = $q.log; Id = $q.id } -MaxEvents $EventScanMax -ErrorAction SilentlyContinue
+          foreach ($e in $evts) {
+            $tm = $null
+            if ($e.TimeCreated) { $tm = $e.TimeCreated.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+            [void]$cleared.Add([ordered]@{ event_id = [int]$q.id; time = $tm })
+          }
+        } catch {}
+      }
+
+      [ordered]@{
+        audit_policy     = $auditPolicy
+        eventlog_running = [bool]$eventlogRunning
+        max_log_sizes    = $maxSizes
+        wef_configured   = [bool]$wef
+        cleared_events   = @($cleared)
+      }
+  register: reg_audit_logging
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record audit_logging collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['audit_logging'] }}"
+  when: reg_audit_logging is failed

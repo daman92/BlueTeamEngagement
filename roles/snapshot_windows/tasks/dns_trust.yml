@@ -1,0 +1,81 @@
+---
+# W13 dns_trust (CONTRACTS §3.2 `dns_trust`)
+# identity: kind, key | other: value, subject, not_before
+# kind in {hosts_entry, dns_server, proxy_winhttp, proxy_user, root_cert, ca_cert}
+#   (certs: key = thumbprint)
+#
+# hosts file entries, per-adapter DNS servers, WinHTTP + per-user proxy, and the
+# LocalMachine Root + CA certificate stores (design W13). netsh is invoked read-only.
+
+- name: "W13 DNS / hosts / proxy / trust store"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+
+      # hosts file
+      $hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+      if (Test-Path -LiteralPath $hostsPath) {
+        foreach ($line in (Get-Content -LiteralPath $hostsPath -ErrorAction SilentlyContinue)) {
+          $t = $line.Trim()
+          if (-not $t -or $t.StartsWith('#')) { continue }
+          $parts = $t -split '\s+'
+          if ($parts.Count -ge 2) {
+            $ip = $parts[0]
+            for ($i = 1; $i -lt $parts.Count; $i++) {
+              $hn = $parts[$i]
+              if ($hn.StartsWith('#')) { break }
+              [void]$out.Add([ordered]@{ kind = 'hosts_entry'; key = $hn; value = $ip; subject = $null; not_before = $null })
+            }
+          }
+        }
+      }
+
+      # DNS servers per adapter
+      try {
+        foreach ($d in (Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+          foreach ($srv in @($d.ServerAddresses)) {
+            if ($srv) { [void]$out.Add([ordered]@{ kind = 'dns_server'; key = "$srv"; value = "$($d.InterfaceAlias)"; subject = $null; not_before = $null }) }
+          }
+        }
+      } catch {}
+
+      # WinHTTP proxy
+      try {
+        $wh = netsh winhttp show proxy 2>$null
+        if ($wh) {
+          $val = (($wh | Where-Object { $_ -match 'Proxy Server|Direct access' } | Select-Object -First 1) -replace '\s+', ' ').Trim()
+          [void]$out.Add([ordered]@{ kind = 'proxy_winhttp'; key = 'winhttp'; value = $val; subject = $null; not_before = $null })
+        }
+      } catch {}
+
+      # per-user proxy (loaded HKU hives)
+      foreach ($u in (Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue)) {
+        $sid = $u.PSChildName
+        if ($sid -match '_Classes$') { continue }
+        $isp = Get-ItemProperty -Path "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+        if ($isp -and $isp.ProxyEnable -eq 1 -and $isp.ProxyServer) {
+          [void]$out.Add([ordered]@{ kind = 'proxy_user'; key = "$sid"; value = "$($isp.ProxyServer)"; subject = $null; not_before = $null })
+        }
+      }
+
+      # trust stores
+      foreach ($store in @(@{ p = 'Cert:\LocalMachine\Root'; k = 'root_cert' }, @{ p = 'Cert:\LocalMachine\CA'; k = 'ca_cert' })) {
+        foreach ($c in (Get-ChildItem -Path $store.p -ErrorAction SilentlyContinue)) {
+          $nb = $null
+          try { $nb = $c.NotBefore.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } catch {}
+          [void]$out.Add([ordered]@{ kind = $store.k; key = "$($c.Thumbprint)"; value = "$($c.Issuer)"; subject = "$($c.Subject)"; not_before = $nb })
+        }
+      }
+      $out
+  register: reg_dns_trust
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record dns_trust collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['dns_trust'] }}"
+  when: reg_dns_trust is failed

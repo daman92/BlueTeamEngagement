@@ -1,0 +1,44 @@
+---
+# tasks/ssh_keys.yml — L9a SSH trust: authorized_keys (CONTRACTS §3.1 `ssh_keys`)
+# identity: user, fingerprint | other: key_type, comment, file
+#
+# authorized_keys(2) per passwd user; per-key fingerprint via `ssh-keygen -lf`
+# (one output line per key: "<bits> <SHA256:fp> <comment> (<TYPE>)").
+# Key added/removed = High (design L9). Record (comment last — free text):
+#   user | fingerprint | key_type | file | comment
+
+- name: L9a collect authorized_keys fingerprints (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    getent passwd | while IFS=: read -r name pw uid gid gecos home shellp; do
+      [ -n "$home" ] && [ -d "$home" ] || continue
+      for kf in "$home/.ssh/authorized_keys" "$home/.ssh/authorized_keys2"; do
+        [ -f "$kf" ] || continue
+        ssh-keygen -lf "$kf" 2>/dev/null | while IFS= read -r kl; do
+          fp=$(printf '%s' "$kl" | awk '{print $2}')
+          [ -n "$fp" ] || continue
+          kt=$(printf '%s' "$kl" | awk '{print $NF}' | tr -d '()')
+          cmt=$(printf '%s' "$kl" | awk '{$1="";$2="";$NF="";gsub(/ +/," ");sub(/^ /,"");sub(/ $/,"");print}')
+          printf '%s\n' "$name$US$fp$US$kt$US$kf$US$cmt"
+        done
+      done
+    done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_cmd_timeout | int }}"
+  register: dw_sshkeys
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L9a stash ssh key records
+  ansible.builtin.set_fact:
+    dw_raw_ssh_keys: "{{ dw_sshkeys.stdout | default('') }}"
+
+- name: L9a mark ssh_keys failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['ssh_keys'] }}"
+  when: (dw_sshkeys.rc | default(1)) != 0

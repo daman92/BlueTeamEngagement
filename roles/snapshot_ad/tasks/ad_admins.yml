@@ -1,0 +1,98 @@
+---
+# tasks/ad_admins.yml — CONTRACTS.md §3.3 ad_admins
+# identity: object_sid | volatile: last_logon_ts
+# other: sam, dn, enabled, when_created, when_changed, pwd_last_set, uac_flags,
+#        admin_count, spns (sorted), privileged_groups (sorted)
+#
+# Every user account that is an effective (recursively-resolved) member of a
+# privileged group, enriched with the authoritative AD attributes W18 calls for.
+
+- name: Collect privileged-account enrichment (ad_admins) via RSAT
+  ansible.windows.win_powershell:
+    parameters:
+      PrivilegedGroups: "{{ dw_ad_privileged_groups }}"
+    script: |
+      param(
+        [string[]]$PrivilegedGroups
+      )
+      $ErrorActionPreference = 'Stop'
+      $Ansible.Changed = $false
+      Import-Module ActiveDirectory -ErrorAction Stop
+
+      function ConvertTo-IsoUtc($dt) {
+        if ($null -eq $dt) { return $null }
+        if ($dt -is [datetime]) { return $dt.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+        return $null
+      }
+      function ConvertFrom-FileTimeUtc($ft) {
+        if ($null -eq $ft) { return $null }
+        try {
+          $l = [int64]$ft
+          if ($l -le 0 -or $l -eq 9223372036854775807) { return $null }
+          return [datetime]::FromFileTimeUtc($l).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        } catch { return $null }
+      }
+      $uacMap = [ordered]@{
+        SCRIPT=0x1; ACCOUNTDISABLE=0x2; HOMEDIR_REQUIRED=0x8; LOCKOUT=0x10;
+        PASSWD_NOTREQD=0x20; PASSWD_CANT_CHANGE=0x40; ENCRYPTED_TEXT_PWD_ALLOWED=0x80;
+        TEMP_DUPLICATE_ACCOUNT=0x100; NORMAL_ACCOUNT=0x200; INTERDOMAIN_TRUST_ACCOUNT=0x800;
+        WORKSTATION_TRUST_ACCOUNT=0x1000; SERVER_TRUST_ACCOUNT=0x2000; DONT_EXPIRE_PASSWORD=0x10000;
+        MNS_LOGON_ACCOUNT=0x20000; SMARTCARD_REQUIRED=0x40000; TRUSTED_FOR_DELEGATION=0x80000;
+        NOT_DELEGATED=0x100000; USE_DES_KEY_ONLY=0x200000; DONT_REQ_PREAUTH=0x400000;
+        PASSWORD_EXPIRED=0x800000; TRUSTED_TO_AUTH_FOR_DELEGATION=0x1000000; PARTIAL_SECRETS_ACCOUNT=0x4000000
+      }
+      function Get-UacFlags($uac) {
+        if ($null -eq $uac) { return @() }
+        $v = [int64]$uac
+        $flags = New-Object System.Collections.Generic.List[string]
+        foreach ($k in $uacMap.Keys) { if ($v -band $uacMap[$k]) { $flags.Add($k) } }
+        return @($flags | Sort-Object)
+      }
+
+      # Map each user DN to the set of privileged groups it is an effective member of.
+      $memberGroups = @{}
+      foreach ($gname in $PrivilegedGroups) {
+        $grp = $null
+        try { $grp = Get-ADGroup -Identity $gname -ErrorAction Stop } catch { continue }
+        $leaves = @()
+        try { $leaves = Get-ADGroupMember -Identity $grp -Recursive -ErrorAction Stop } catch { $leaves = @() }
+        foreach ($m in $leaves) {
+          if ($m.objectClass -ne 'user') { continue }
+          $key = [string]$m.distinguishedName
+          if (-not $memberGroups.ContainsKey($key)) { $memberGroups[$key] = New-Object System.Collections.Generic.List[string] }
+          $memberGroups[$key].Add([string]$grp.Name)
+        }
+      }
+
+      $props = @('objectSid','samAccountName','distinguishedName','Enabled','whenCreated',
+                 'whenChanged','PasswordLastSet','lastLogonTimestamp','userAccountControl',
+                 'adminCount','servicePrincipalName')
+      $result = New-Object System.Collections.Generic.List[object]
+      foreach ($dn in $memberGroups.Keys) {
+        $u = $null
+        try { $u = Get-ADUser -Identity $dn -Properties $props -ErrorAction Stop } catch { continue }
+        $result.Add(@{
+          object_sid        = [string]$u.objectSid.Value
+          sam               = [string]$u.samAccountName
+          dn                = [string]$u.distinguishedName
+          enabled           = [bool]$u.Enabled
+          when_created      = (ConvertTo-IsoUtc $u.whenCreated)
+          when_changed      = (ConvertTo-IsoUtc $u.whenChanged)
+          pwd_last_set      = (ConvertTo-IsoUtc $u.PasswordLastSet)
+          last_logon_ts     = (ConvertFrom-FileTimeUtc $u.lastLogonTimestamp)
+          uac_flags         = (Get-UacFlags $u.userAccountControl)
+          admin_count       = [int]($u.adminCount)
+          spns              = @($u.servicePrincipalName | Sort-Object -Unique)
+          privileged_groups = @($memberGroups[$dn] | Sort-Object -Unique)
+        })
+      }
+      $Ansible.Result = @($result)
+  register: ad_admins_reg
+  ignore_errors: true
+  changed_when: false
+  tags: [readonly]
+
+- name: Capture ad_admins result / status
+  ansible.builtin.set_fact:
+    ad_admins_items: "{{ ad_admins_reg.result | default([]) if ad_admins_reg is not failed else [] }}"
+    dw_ad_failed_categories: "{{ dw_ad_failed_categories + (['ad_admins'] if ad_admins_reg is failed else []) }}"

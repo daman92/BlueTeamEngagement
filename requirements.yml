@@ -1,0 +1,45 @@
+---
+# driftwatch — Ansible collection requirements (design §3.1, Appendix B #3/#15/#17).
+#
+# Versions are PINNED exactly, not ranged. The kit is a reproducible hardened image
+# rebuilt per engagement; a floating dependency that resolves differently between two
+# engagements is exactly the kind of surprise the portable model is built to avoid.
+# Bump these deliberately, re-run the pilot detection test, then re-bake the image.
+#
+# Install into the repo-local path the pinned ansible.cfg expects:
+#   ansible-galaxy collection install -r requirements.yml -p ./collections
+#
+# NOT installable here (bake into the kit IMAGE, per design §3.1):
+#   * krb5-user / krb5-workstation  — kinit, klist for the Kerberos transport
+#   * pywinrm[kerberos]             — WinRM-HTTPS + Kerberos from a non-domain-joined kit
+#   * chrony                        — clock sync within 5 min of the DC (preflight gate)
+#   These are OS packages / pip wheels, not Galaxy collections.
+
+collections:
+  # --- core transports & helpers (every engagement needs these) --------------
+  - name: ansible.windows            # WinRM/PowerShell modules: win_powershell, win_command
+    version: "2.5.0"
+  - name: community.windows          # win_* extras used by W5–W17 collection
+    version: "2.3.0"
+  - name: ansible.posix              # mount/firewalld facts, profile_tasks callback
+    version: "1.6.2"
+  - name: community.general          # ldap_search (AD via LDAP when RSAT absent), log_plays callback
+    version: "10.1.0"
+  - name: ansible.netcommon          # network_cli / httpapi connections, cli_command (T2/T3 packs)
+    version: "7.1.0"
+
+  # --- network vendor collections (T1 full-support set, design §4.3) ---------
+  - name: cisco.ios                  # IOS / IOS-XE switches & routers
+    version: "8.0.0"
+  - name: cisco.nxos                 # Nexus
+    version: "8.0.0"
+  - name: cisco.asa                  # ASA firewalls
+    version: "6.0.0"
+  - name: arista.eos                 # EOS / vEOS
+    version: "10.0.0"
+  - name: junipernetworks.junos      # JunOS / vSRX
+    version: "9.1.0"
+  - name: fortinet.fortios           # FortiGate / virtual FortiGate
+    version: "2.3.8"
+  - name: paloaltonetworks.panos     # PAN-OS (config API collection)
+    version: "2.20.4"

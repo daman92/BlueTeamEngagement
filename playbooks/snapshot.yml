@@ -1,0 +1,54 @@
+---
+# snapshot.yml — host collection for Linux, Windows, and AD-enrichment groups.
+# One canonical JSON document per host per run, ASSEMBLED ON THE CONTROL NODE by the roles
+# (delegate_to: localhost); nothing snapshot-related is written to target disks (§5).
+#
+# Performance & failure handling (design §8):
+#   * forks come from ansible.cfg (25).
+#   * Windows plays run in `serial` batches — WinRM round-trips dominate, so bounding the
+#     batch keeps memory and connection count sane on WinRM-heavy fleets.
+#   * A failed category never fails the play: the roles wrap each category in
+#     ignore_errors + record it in meta.failed_categories, marking the snapshot `partial`.
+#     `any_errors_fatal: false` keeps one bad host from aborting the fleet — a broken
+#     collection is reported as a coverage gap, not silence (§5 rule 5).
+#   * Deep/expensive categories (hashing, packages, cert stores) are gated on `dw_deep`
+#     and run async inside the roles.
+#
+# Extra vars supplied by bin/driftwatch: dw_engagement, dw_engagement_dir, dw_run_id,
+# dw_snapshot_dir, dw_deep, dw_hash_policy, dw_transport_matrix.
+
+- name: Linux snapshots (§4.1 / role snapshot_linux)
+  hosts: linux
+  gather_facts: true
+  become: true                    # scoped sudo command-allowlist per §3 — reads only
+  any_errors_fatal: false
+  max_fail_percentage: 100
+  strategy: linear
+  roles:
+    - role: snapshot_linux
+  tags: [snapshot, linux]
+
+- name: Windows snapshots (§4.2 / role snapshot_windows)
+  hosts: windows
+  gather_facts: true
+  # Batch WinRM-heavy groups so a large fleet does not open 25 simultaneous WinRM sessions.
+  serial: "20%"
+  any_errors_fatal: false
+  max_fail_percentage: 100
+  strategy: linear
+  roles:
+    - role: snapshot_windows
+  tags: [snapshot, windows]
+
+# AD enrichment runs ONCE PER DOMAIN, not once per host, or you hammer the DC with N
+# identical queries (§4.2 W18). Convention: the operator places exactly one domain-joined
+# host (a DC or any domain member) per domain into the `ad` group; snapshot_ad emits one
+# document per domain to snapshots/_domain_<fqdn>/<run_id>.json. serial: 1 keeps DC load low.
+- name: AD enrichment (§4.2 W18 / role snapshot_ad — once per domain)
+  hosts: ad
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: false
+  roles:
+    - role: snapshot_ad
+  tags: [snapshot, ad]

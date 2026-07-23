@@ -1,0 +1,146 @@
+---
+# =============================================================================
+# Tier-1 response play · revoke_session   (design §13.3 / §13.4 / §13.6)
+#
+# Reversible containment: terminate the named user's interactive session(s) and purge
+# cached credentials/tickets so a stolen session cannot keep being used. This is
+# "reversible" in the Tier-1 sense of design §13.2 — it destroys no persistent state;
+# the legitimate user simply re-authenticates. There is therefore nothing to "restore",
+# so the rollback branch is an explicit, logged no-op rather than a state rewrite.
+#
+# Pair this with disable_account for a stolen credential: revoke_session ends the live
+# session now; disable_account stops the next logon.
+#
+# Mandatory pattern (design §13.2): PRESERVE the session list before acting; the ACT
+# tasks honour --check; the play refuses to mutate without dw_authorized; serial: 1
+# canary; any_errors_fatal halts on first failure.
+# =============================================================================
+
+- name: "Tier-1 · revoke_session (kill session / token)"
+  hosts: "{{ dw_target_hosts | mandatory }}"
+  gather_facts: false
+  serial: 1
+  any_errors_fatal: true
+  # dw_case_id, dw_session_user, dw_platform, dw_evidence_dir, dw_audit_log,
+  # dw_authorized and dw_rollback arrive as extra-vars from respond.py. They are
+  # deliberately NOT re-declared under vars: — a play var of the form
+  # dw_x: "{{ dw_x | default(...) }}" is a fatal recursive template in Ansible.
+  # The GATE below asserts their presence instead.
+  vars:
+    dw_tier: 1
+    dw_reversible: true
+
+  pre_tasks:
+    - name: "GATE · required dw_* extra-vars are present (passed by respond.py)"
+      ansible.builtin.assert:
+        that:
+          - dw_case_id is defined
+          - dw_session_user is defined
+          - dw_platform is defined
+          - dw_evidence_dir is defined
+          - dw_audit_log is defined
+          - dw_authorized is defined
+          - dw_rollback is defined
+        fail_msg: >-
+          Missing required dw_* extra-vars. This play is invoked by
+          response/scripts/respond.py, which supplies them with -e; do not run it
+          by hand without providing the full set.
+
+    - name: "GATE · refuse to change anything without an approved case"
+      ansible.builtin.assert:
+        that:
+          - "dw_authorized | bool"
+        fail_msg: >-
+          Case {{ dw_case_id }} is not approved. Run `respond approve --case
+          {{ dw_case_id }}` first. (Dry runs with --check skip this gate.)
+      when: not ansible_check_mode
+
+  tasks:
+    # ---- PRESERVE (read-only, always runs, even in --check) -----------------
+    - name: "PRESERVE · capture the user's active sessions (Windows)"
+      ansible.windows.win_powershell:
+        script: |
+          (quser 2>$null | Select-String -Pattern '{{ dw_session_user }}') -join "`n"
+      register: dw_before_win
+      check_mode: false
+      changed_when: false
+      when: dw_platform == 'windows'
+
+    - name: "PRESERVE · capture the user's active sessions (Linux)"
+      ansible.builtin.command:
+        cmd: "loginctl list-sessions --no-legend"
+      register: dw_before_linux
+      check_mode: false
+      changed_when: false
+      failed_when: false
+      when: dw_platform != 'windows'
+
+    - name: "PRESERVE · write before-state to the evidence store (control node)"
+      ansible.builtin.copy:
+        dest: "{{ dw_evidence_dir }}/{{ inventory_hostname }}.sessions_before.txt"
+        content: >-
+          user={{ dw_session_user }} host={{ inventory_hostname }}
+          {{ dw_before_win.output | default(dw_before_linux.stdout) | default('unknown') }}
+      delegate_to: localhost
+      check_mode: false
+
+    # ---- ACT (revoke) -------------------------------------------------------
+    - name: "ACT · log off the user's sessions (Windows) — honours --check"
+      ansible.windows.win_powershell:
+        script: |
+          # Log off every session owned by the user. Logoff destroys that logon
+          # session's credential/ticket cache with it — a `klist purge` here would
+          # only purge THIS task's own (collector) logon session, not the target
+          # user's, so logoff is the correct and sufficient revocation.
+          # quser's SESSIONNAME column is BLANK for disconnected sessions (the
+          # classic hijack case), which shifts the columns — so take the first
+          # all-digit token after the username instead of a fixed column index.
+          $lines = quser 2>$null | Select-String -Pattern '{{ dw_session_user }}'
+          foreach ($l in $lines) {
+            $tokens = $l.ToString().Trim().TrimStart('>') -split '\s+'
+            $id = $tokens | Where-Object { $_ -match '^\d+$' } | Select-Object -First 1
+            if ($id) { logoff $id }
+          }
+      register: dw_act_win
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform == 'windows'
+        # win_powershell runs its script even in check mode, so guard the WRITE:
+        # a `propose --check` dry run must make no target-changing contact (design
+        # §14). The Linux command task below auto-skips in check mode already.
+        - not ansible_check_mode
+
+    - name: "ACT · terminate the user's sessions (Linux) — honours --check"
+      ansible.builtin.command:
+        cmd: "loginctl terminate-user {{ dw_session_user }}"
+      register: dw_act_linux
+      changed_when: dw_act_linux.rc == 0
+      when:
+        - not (dw_rollback | bool)
+        - dw_platform != 'windows'
+
+    # ---- ROLLBACK (explicit no-op: nothing was destroyed) -------------------
+    - name: "ROLLBACK · no state to restore — the user re-authenticates"
+      ansible.builtin.debug:
+        msg: >-
+          revoke_session for case {{ dw_case_id }} destroys no persistent state on
+          {{ inventory_hostname }}; there is nothing to roll back. If the session was
+          legitimate, {{ dw_session_user }} simply signs in again. Consider whether
+          disable_account should also be rolled back.
+      when: dw_rollback | bool
+
+  post_tasks:
+    - name: "LOG · append this play's action to the append-only audit log"
+      ansible.builtin.lineinfile:
+        path: "{{ dw_audit_log }}"
+        create: true
+        insertafter: EOF
+        line: >-
+          {{ now(true, '%Y-%m-%dT%H:%M:%SZ') }} | play=revoke_session |
+          case={{ dw_case_id }} | host={{ inventory_hostname }} |
+          user={{ dw_session_user }} |
+          action={{ 'rollback_noop' if (dw_rollback | bool) else 'revoke' }} |
+          outcome=ok
+      delegate_to: localhost
+      check_mode: false
+      when: not ansible_check_mode

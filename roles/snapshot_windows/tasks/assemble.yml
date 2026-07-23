@@ -1,0 +1,60 @@
+---
+# Assemble the full snapshot document (CONTRACTS §2 / §3.2) and write it to the CONTROL
+# node. Top-level keys are exactly `meta` + the windows category keys. Object categories
+# take the single emitted object (win_powershell returns each read's output as a list);
+# array categories take the emitted list. Missing/failed reads default to []/{} so the
+# document is always structurally complete and the diff engine can compare it.
+#
+# READ-ONLY GUARANTEE: the only write modules in this role are here, and every one is
+# `delegate_to: localhost` — nothing is written to the target (enforced by
+# scripts/lint_readonly.py).
+
+- name: "Assemble the Windows snapshot document"
+  ansible.builtin.set_fact:
+    dw_snapshot:
+      meta:
+        schema_version: "1.0"
+        host: "{{ inventory_hostname }}"
+        platform: "windows"
+        os: "{{ reg_hostmeta.output[0].os | default('Windows') }}"
+        collected_at: "{{ reg_hostmeta.output[0].collected_at | default(now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ')) }}"
+        collector_version: "driftwatch 0.1.0"
+        engagement: "{{ dw_engagement }}"
+        run_id: "{{ dw_run_id }}"
+        partial: "{{ (dw_failed_categories | length) > 0 }}"
+        failed_categories: "{{ dw_failed_categories | sort }}"
+        transport: "{{ dw_transport | trim }}"
+        hash_policy: "{{ dw_hash_policy }}"
+      processes: "{{ reg_processes.output | default([]) }}"
+      fileless: "{{ reg_fileless.output | default([]) }}"
+      listening: "{{ reg_listening.output | default([]) }}"
+      connections: "{{ reg_connections.output | default([]) }}"
+      scheduled_tasks: "{{ reg_scheduled_tasks.output | default([]) }}"
+      services: "{{ reg_services.output | default([]) }}"
+      autoruns: "{{ reg_autoruns.output | default([]) }}"
+      wmi_subscriptions: "{{ reg_wmi_subscriptions.output | default([]) }}"
+      users: "{{ reg_users.output | default([]) }}"
+      local_groups: "{{ reg_local_groups.output | default([]) }}"
+      drivers: "{{ reg_drivers.output | default([]) }}"
+      software: "{{ reg_software.output | default([]) }}"
+      hotfixes: "{{ reg_hotfixes.output | default([]) }}"
+      firewall: "{{ reg_firewall.output | default([]) }}"
+      dns_trust: "{{ reg_dns_trust.output | default([]) }}"
+      audit_logging: "{{ (reg_audit_logging.output | default([]) | first) | default({}) }}"
+      shares: "{{ reg_shares.output | default([]) }}"
+      powershell_surface: "{{ (reg_powershell_surface.output | default([]) | first) | default({}) }}"
+      security_posture: "{{ (reg_security_posture.output | default([]) | first) | default({}) }}"
+
+- name: "Ensure the host snapshot directory exists on the control node"
+  ansible.builtin.file:
+    path: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+
+- name: "Write the snapshot document to the control node"
+  ansible.builtin.copy:
+    dest: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}/{{ dw_run_id }}.json"
+    content: "{{ lookup('template', 'snapshot.json.j2') }}"
+    mode: "0600"
+  delegate_to: localhost

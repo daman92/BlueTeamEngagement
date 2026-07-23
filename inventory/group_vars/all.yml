@@ -1,0 +1,35 @@
+# driftwatch — shared group_vars for ALL hosts (design §3, §5; CONTRACTS §1.5)
+# =============================================================================
+# These are repo-level defaults applied to every group. Per-run identity
+# (dw_engagement, dw_engagement_dir, dw_run_id) is set ONCE PER RUN by
+# bin/driftwatch and passed on the command line with `-e`, so it is not
+# hard-coded here — the defaults below only make the vars resolvable when a play
+# is invoked directly for testing. Anything a role writes goes to the control
+# node (delegate_to: localhost); roles write NOTHING to targets (CONTRACTS §1.5).
+# =============================================================================
+
+# --- dw_* run variables (CONTRACTS §1.5) -------------------------------------
+# Provided by the CLI via -e at run time; env-var fallbacks keep ad-hoc runs working.
+dw_engagement: "{{ lookup('env', 'DRIFTWATCH_ENGAGEMENT') | default('', true) }}"
+dw_engagement_dir: "{{ lookup('env', 'DRIFTWATCH_ENGAGEMENT_DIR') | default('', true) }}"
+dw_run_id: "{{ lookup('env', 'DRIFTWATCH_RUN_ID') | default('', true) }}"
+# Derived: where assembled snapshots land on the control node.
+dw_snapshot_dir: "{{ dw_engagement_dir }}/snapshots"
+# Deep/expensive categories (hashing, package inventory, cert stores) — the CLI
+# sets this true for `collect --deep`; default off for the cheap fast set.
+dw_deep: false
+# Hash tiering knob (design C.2). The CLI overrides from scope.yml settings.
+dw_hash_policy: tiered
+
+# --- read-only posture / footprint minimization ------------------------------
+# Fact gathering is a PLAY-level decision made in playbooks/*.yml (snapshot plays
+# gather what meta.os needs; everything else runs gather_facts: false) — it is a
+# play keyword, not a variable, so it is deliberately not set here.
+# Hard per-task ceiling so one hung host cannot stall the fleet (design §8). A
+# failed category never fails the play — it is recorded in meta.failed_categories.
+ansible_command_timeout: 60
+ansible_timeout: 30
+
+# --- integrity / provenance stamped into every snapshot (CONTRACTS §1.3) -----
+dw_schema_version: "1.0"
+dw_collector_version: "driftwatch 0.1.0"

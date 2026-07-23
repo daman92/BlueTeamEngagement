@@ -1,0 +1,41 @@
+---
+# tasks/packages.yml — L12 installed packages (CONTRACTS §3.1 `packages`)
+# identity: name, arch | other: version
+#
+# dpkg-query -W (Debian family) / rpm -qa (RHEL family). DEEP RUNS ONLY (design
+# §8: package inventory belongs to the daily deep set) — on fast runs the category
+# is an empty array and the diff engine compares deep runs against deep runs at
+# the analyst's cadence. Record: name | arch | version
+
+- name: L12 collect installed packages (read-only, deep runs only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    if command -v dpkg-query >/dev/null 2>&1; then
+      dpkg-query -W -f '${Package}\t${Architecture}\t${Version}\n' 2>/dev/null \
+        | awk -F'\t' -v US="$US" 'NF >= 3 {print $1 US $2 US $3}'
+    elif command -v rpm >/dev/null 2>&1; then
+      rpm -qa --qf '%{NAME}\t%{ARCH}\t%{EPOCH}:%{VERSION}-%{RELEASE}\n' 2>/dev/null \
+        | awk -F'\t' -v US="$US" 'NF >= 3 {v=$3; sub(/^\(none\):/,"",v); print $1 US $2 US v}'
+    fi
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_pkgs
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  when: dw_deep | bool
+  tags: [readonly]
+
+- name: L12 stash package records
+  ansible.builtin.set_fact:
+    dw_raw_packages: "{{ dw_pkgs.stdout | default('') }}"
+
+- name: L12 mark packages failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['packages'] }}"
+  when:
+    - dw_deep | bool
+    - (dw_pkgs.rc | default(1)) != 0

@@ -1,0 +1,117 @@
+# driftwatch — ILLUSTRATIVE inventory (design §3). NOT loaded at runtime.
+# =============================================================================
+# This file shows the group tree the roles and group_vars expect. It is a
+# reference only, hence the `.example` suffix.
+#
+# A REAL engagement inventory is GENERATED, never hand-written:
+#   scripts/scope_gate.py generate --engagement-dir engagements/<id>
+# reads scope.yml's in_scope allow-list and writes
+#   engagements/<id>/inventory/hosts.yml   (+ fleet_groups.json)
+# so an out-of-scope address can never enter the inventory in the first place
+# (scope layer 1, design §15.2). Editing a generated inventory by hand would
+# bypass that authorization rail — don't.
+#
+# Group names here line up with inventory/group_vars/{linux,windows,network}.yml
+# and with the `groups:` you assign in scope.yml. `ansible_network_os` and
+# per-host transport overrides (e.g. the OpenSSH fallback) are shown inline.
+# =============================================================================
+
+all:
+  children:
+
+    linux:
+      children:
+        rhel:
+          hosts:
+            web01.acme.example:
+              ansible_host: 10.10.2.11
+            web02.acme.example:
+              ansible_host: 10.10.2.12
+        debian:
+          hosts:
+            build01.acme.example:
+              ansible_host: 10.10.2.30
+
+    windows:
+      children:
+        win_servers:
+          hosts:
+            fs01.acme.example:          # domain-joined server -> Kerberos/WinRM (rung 1)
+              ansible_host: 10.10.1.20
+            dc01.acme.example:          # DC: also in crown_jewels and ad (see below)
+              ansible_host: 10.10.1.5
+        win_workstations:
+          hosts:
+            wks-4471.acme.example:
+              ansible_host: 10.10.5.71
+            wks-legacy1.acme.example:   # WinRM disabled here -> OpenSSH fallback (rung 2)
+              ansible_host: 10.10.5.99
+              ansible_connection: ssh
+              ansible_shell_type: powershell
+
+    network:
+      children:
+        switches:
+          children:
+            ios_switches:
+              hosts:
+                acc-sw-11.acme.example:
+                  ansible_host: 10.10.0.31
+                core-sw-01.acme.example:  # core switch: also in crown_jewels (see below)
+                  ansible_host: 10.10.0.30
+              vars:
+                ansible_network_os: cisco.ios.ios
+            eos_switches:
+              hosts:
+                spine-01.acme.example:
+                  ansible_host: 10.10.0.41
+              vars:
+                ansible_network_os: arista.eos.eos
+        routers:
+          children:
+            ios_routers:
+              hosts:
+                edge-rtr-01.acme.example:
+                  ansible_host: 10.10.0.1
+              vars:
+                ansible_network_os: cisco.ios.ios
+            junos_routers:
+              hosts:
+                edge-rtr-02.acme.example:
+                  ansible_host: 10.10.0.2
+              vars:
+                ansible_network_os: junipernetworks.junos.junos
+        firewalls:
+          children:
+            asa:
+              hosts:
+                fw-01.acme.example:
+                  ansible_host: 10.10.0.5
+              vars:
+                ansible_network_os: cisco.asa.asa
+            fortios:
+              hosts: {}
+            panos:
+              hosts: {}
+
+    # Cross-cutting tier: DCs, hypervisors, PKI, core switches. A host lives in
+    # its platform group AND here (dc01 is also in win_servers, core-sw-01 in
+    # ios_switches above); crown_jewels get `hash_policy: full` treatment
+    # (design C.2) and are collected first.
+    crown_jewels:
+      hosts:
+        dc01.acme.example:
+          ansible_host: 10.10.1.5
+        core-sw-01.acme.example:
+          ansible_host: 10.10.0.30
+
+    # AD enrichment (platform: "ad", design W18) runs ONCE PER DOMAIN, not per
+    # host: place EXACTLY ONE domain-joined Windows host per domain here (a DC,
+    # or any domain member) — playbooks/snapshot.yml targets `hosts: ad` with
+    # serial: 1 and snapshot_ad writes one document per domain to
+    # snapshots/_domain_<fqdn>/<run_id>.json. The host stays in its windows
+    # group too, so it inherits the WinRM/Kerberos connection vars.
+    ad:
+      hosts:
+        dc01.acme.example:
+          ansible_host: 10.10.1.5

@@ -1,0 +1,30 @@
+---
+# roles/snapshot_ad/meta/main.yml
+galaxy_info:
+  role_name: snapshot_ad
+  namespace: driftwatch
+  author: driftwatch
+  description: >-
+    Read-only Active Directory enrichment collector for driftwatch. Runs once per
+    domain (delegated to a DC or domain-joined host) and emits a single canonical
+    `platform: ad` snapshot document (CONTRACTS.md §3.3) to the control node. Makes
+    no changes to any target — enforced by scripts/lint_readonly.py.
+  company: "internal — security team"
+  license: "proprietary — internal use"
+  min_ansible_version: "2.14"
+  platforms:
+    - name: Windows
+      versions:
+        - all
+  galaxy_tags:
+    - security
+    - blueteam
+    - activedirectory
+    - drift
+    - readonly
+
+# Collection prerequisites (declared here for documentation; pinned in the kit's
+# top-level requirements.yml, not installed by this role):
+#   - ansible.windows        (win_powershell transport for RSAT collection)
+#   - community.general      (ldap_search — RSAT-absent fallback)
+dependencies: []

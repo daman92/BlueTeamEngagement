@@ -1,0 +1,210 @@
+---
+# roles/snapshot_network/tasks/main.yml
+#
+# Tier detection -> dispatch -> common sanitize / hash / assemble / write.
+# Implements design §4.3 (three-tier T1/T2/T3) + §4.4 note, producing the
+# CONTRACTS.md §3.4 `network` snapshot.
+#
+# READ-ONLY BY CONSTRUCTION (design §9 / §15.3, enforced by scripts/lint_readonly.py):
+#   * no *_config modules anywhere; collection uses cli_command / *_facts only;
+#   * cli/command tasks carry the `readonly` tag (assertion: they only read);
+#   * the ONLY writes are the assembled snapshot JSON and the sanitized config
+#     text, both `delegate_to: localhost` (control node), never the target.
+#
+# A failed category never fails the play: source commands use `ignore_errors`,
+# the tier handlers record failures in `dw_failed_categories`, and the snapshot
+# is marked `partial` accordingly.
+
+# --------------------------------------------------------------------------- #
+# 0. Accumulators
+# --------------------------------------------------------------------------- #
+- name: Initialize snapshot accumulators
+  ansible.builtin.set_fact:
+    dw_net_categories: {}
+    dw_failed_categories: []
+    dw_net_config_raw: ""
+    dw_net_detected_os: ""
+    dw_collection_tier: ""
+    dw_net_os: "{{ ansible_network_os | default('', true) }}"
+    dw_net_volatile_combined: "{{ dw_net_volatile_patterns | join('|') }}"
+
+# --------------------------------------------------------------------------- #
+# 1. Fingerprint (only when no ansible_network_os is declared)
+# --------------------------------------------------------------------------- #
+- name: Fingerprint device from banner (no ansible_network_os declared)
+  ansible.netcommon.cli_command:
+    command: "{{ dw_net_fingerprint_command }}"
+  register: r_fingerprint
+  ignore_errors: true
+  when: dw_net_os | length == 0
+  tags: [readonly]
+
+- name: Record fingerprint banner text
+  ansible.builtin.set_fact:
+    dw_net_banner: >-
+      {{ (r_fingerprint.stdout | default(''))
+         if (r_fingerprint is defined and not (r_fingerprint.failed | default(false)))
+         else '' }}
+
+# --------------------------------------------------------------------------- #
+# 2. Command packs are DATA (design §4.3 T2): discover + fingerprint-match
+# --------------------------------------------------------------------------- #
+- name: Discover command-pack files
+  ansible.builtin.set_fact:
+    dw_net_pack_files: "{{ query('ansible.builtin.fileglob', role_path ~ '/command_packs/*.yml') | sort }}"
+
+- name: Load command packs
+  ansible.builtin.set_fact:
+    dw_net_packs: >-
+      {{ (dw_net_packs | default([]))
+         + [ (lookup('ansible.builtin.file', item) | from_yaml) | combine({'_file': item}) ] }}
+  loop: "{{ dw_net_pack_files }}"
+  loop_control:
+    label: "{{ item | basename }}"
+
+- name: Select a command pack (by declared OS, else by banner fingerprint)
+  ansible.builtin.set_fact:
+    dw_net_pack: "{{ item }}"
+  loop: "{{ dw_net_packs | default([]) }}"
+  loop_control:
+    label: "{{ item.meta.vendor | default('pack') }}"
+  when:
+    - dw_net_pack is not defined
+    - (dw_net_os | length > 0 and (item.meta.os | default('')) == dw_net_os)
+      or (dw_net_banner | default('') | length > 0
+          and (item.meta.fingerprint | default([]) | length > 0)
+          and (dw_net_banner | regex_search('(?i)' ~ (item.meta.fingerprint | join('|')))) is not none)
+
+# --------------------------------------------------------------------------- #
+# 3. Decide tier and dispatch (detect, then degrade — design §4.3)
+# --------------------------------------------------------------------------- #
+- name: Decide collection tier
+  ansible.builtin.set_fact:
+    dw_collection_tier: >-
+      {{ 'T1' if (dw_net_os in dw_net_t1_ios_os)
+         else ('T2' if (dw_net_pack is defined) else 'T3') }}
+
+- name: Collect — Tier 1 (Cisco IOS / IOS-XE worked example)
+  ansible.builtin.include_tasks: t1_ios.yml
+  when: dw_collection_tier == 'T1'
+
+- name: Collect — Tier 2 (YAML command pack)
+  ansible.builtin.include_tasks: t2_commandpack.yml
+  when: dw_collection_tier == 'T2'
+
+- name: Collect — Tier 3 (generic ladder / config-text backstop)
+  ansible.builtin.include_tasks: t3_generic.yml
+  when: dw_collection_tier == 'T3'
+
+# --------------------------------------------------------------------------- #
+# 4. Sanitize the running config (all tiers): strip volatile, redact secrets
+# --------------------------------------------------------------------------- #
+- name: Strip volatile lines from the running config
+  ansible.builtin.set_fact:
+    dw_net_config_lines: >-
+      {{ (dw_net_config_raw | default('')).splitlines()
+         | reject('regex', dw_net_volatile_combined)
+         | list }}
+  when: (dw_net_config_raw | default('')) | length > 0
+
+- name: Redact secrets to salted hashes (raw secret never stored)
+  ansible.builtin.set_fact:
+    # For each line, the first matching secret rule replaces its secret token
+    # (group 2) with salted-sha256(salt+token) while keeping the keyword prefix
+    # (group 1) and trailing context (group 3). Changed secrets still change the
+    # hash, so drift stays detectable; the plaintext secret is discarded.
+    # NOTE: plain `set` bindings do NOT survive Jinja loop scopes, so the
+    # per-line working value lives in a namespace (lns.red) — the only way the
+    # redacted value actually reaches ns.lines.
+    dw_net_config_sanitized: |-
+      {%- set ns = namespace(lines=[]) -%}
+      {%- for line in dw_net_config_lines -%}
+        {%- set lns = namespace(red=line) -%}
+        {%- for rule in dw_net_secret_rules -%}
+          {%- if (lns.red | regex_search(rule)) is not none -%}
+            {%- set secret = lns.red | regex_replace(rule, '\g<2>') -%}
+            {%- set digest = (dw_redaction_salt ~ secret) | hash('sha256') -%}
+            {%- set lns.red = lns.red | regex_replace(rule, '\g<1>' ~ digest ~ '\g<3>') -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- set ns.lines = ns.lines + [lns.red] -%}
+      {%- endfor -%}
+      {{ ns.lines | join('\n') }}
+  when: dw_net_config_lines is defined
+
+# --------------------------------------------------------------------------- #
+# 5. device_config category (CONTRACTS.md §3.4): sha256 / line_count / path / tier
+# --------------------------------------------------------------------------- #
+- name: Build device_config category from the sanitized config
+  ansible.builtin.set_fact:
+    dw_net_categories: >-
+      {{ dw_net_categories | combine({
+           'device_config': {
+             'sha256': dw_net_config_sanitized | hash('sha256'),
+             'line_count': dw_net_config_sanitized.splitlines() | length,
+             'config_path': 'configs/' ~ inventory_hostname ~ '/' ~ dw_run_id ~ '.conf',
+             'tier': dw_collection_tier
+           } }) }}
+  when: dw_net_config_sanitized is defined
+
+- name: Record device_config as failed when no config text was retrieved
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ (dw_failed_categories + ['device_config']) | unique | sort }}"
+  when: dw_net_config_sanitized is not defined
+
+# --------------------------------------------------------------------------- #
+# 6. Write the sanitized config text to the CONTROL NODE (never the target)
+# --------------------------------------------------------------------------- #
+- name: Ensure the engagement config directory exists on the control node
+  ansible.builtin.file:
+    path: "{{ dw_engagement_dir }}/configs/{{ inventory_hostname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  when: dw_net_config_sanitized is defined
+
+- name: Write the sanitized device config to the control node
+  ansible.builtin.copy:
+    content: "{{ dw_net_config_sanitized }}\n"
+    dest: "{{ dw_engagement_dir }}/configs/{{ inventory_hostname }}/{{ dw_run_id }}.conf"
+    mode: "0600"
+  delegate_to: localhost
+  when: dw_net_config_sanitized is defined
+
+# --------------------------------------------------------------------------- #
+# 7. Assemble meta (CONTRACTS.md §2; collection_tier is network-only)
+# --------------------------------------------------------------------------- #
+- name: Assemble snapshot meta
+  ansible.builtin.set_fact:
+    dw_net_meta:
+      schema_version: "1.0"
+      host: "{{ inventory_hostname }}"
+      platform: "network"
+      os: >-
+        {{ dw_net_detected_os if (dw_net_detected_os | length > 0)
+           else (dw_net_os if (dw_net_os | length > 0) else 'unknown') }}
+      collected_at: "{{ now(true, '%Y-%m-%dT%H:%M:%SZ') }}"
+      collector_version: "driftwatch 0.1.0"
+      engagement: "{{ dw_engagement }}"
+      run_id: "{{ dw_run_id }}"
+      partial: "{{ (dw_failed_categories | length) > 0 }}"
+      failed_categories: "{{ dw_failed_categories | sort }}"
+      collection_tier: "{{ dw_collection_tier }}"
+      hash_policy: "{{ dw_hash_policy }}"
+
+# --------------------------------------------------------------------------- #
+# 8. Write the assembled snapshot document to the CONTROL NODE
+# --------------------------------------------------------------------------- #
+- name: Ensure the snapshot directory exists on the control node
+  ansible.builtin.file:
+    path: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+
+- name: Write the assembled snapshot document to the control node
+  ansible.builtin.template:
+    src: snapshot.json.j2
+    dest: "{{ dw_snapshot_dir }}/{{ inventory_hostname }}/{{ dw_run_id }}.json"
+    mode: "0600"
+  delegate_to: localhost

@@ -1,0 +1,41 @@
+---
+# W12 firewall (CONTRACTS §3.2 `firewall`)
+# identity: direction, action, program, port, profile | other: enabled, rule_name
+#
+# Enabled Allow rules joined to their application and port filters (design W12). The
+# per-rule filter joins are the cost here; scoping to enabled Allow rules keeps it bounded
+# while capturing the security-relevant openings.
+
+- name: "W12 host firewall"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'SilentlyContinue'
+
+      $out = New-Object System.Collections.ArrayList
+      try {
+        foreach ($r in (Get-NetFirewallRule -Enabled True -Action Allow -ErrorAction Stop)) {
+          $prog = $null; $port = $null
+          try { $af = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue; if ($af) { $prog = "$($af.Program)" } } catch {}
+          try { $pf = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue; if ($pf) { $port = "$($pf.LocalPort)" } } catch {}
+          [void]$out.Add([ordered]@{
+            direction = "$($r.Direction)"
+            action    = "$($r.Action)"
+            program   = $prog
+            port      = $port
+            profile   = "$($r.Profile)"
+            enabled   = $true
+            rule_name = $r.DisplayName
+          })
+        }
+      } catch {}
+      $out
+  register: reg_firewall
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record firewall collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['firewall'] }}"
+  when: reg_firewall is failed

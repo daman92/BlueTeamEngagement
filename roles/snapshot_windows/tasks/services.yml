@@ -1,0 +1,51 @@
+---
+# W6 services (CONTRACTS §3.2 `services`)
+# identity: name | volatile: state
+# other:    display_name, path, args, start_type, account, unquoted (bool)
+#
+# `unquoted` flags the classic unquoted-service-path weakness: an unquoted PathName whose
+# executable path contains whitespace (design W6).
+
+- name: "W6 services"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $out = foreach ($s in (Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) {
+        $pathName = $s.PathName
+        $exe = $null; $svcArgs = $null; $unquoted = $false
+        if ($pathName) {
+          $pn = $pathName.Trim()
+          if ($pn.StartsWith('"')) {
+            $end = $pn.IndexOf('"', 1)
+            if ($end -gt 0) { $exe = $pn.Substring(1, $end - 1); $svcArgs = $pn.Substring($end + 1).Trim() }
+            else { $exe = $pn }
+          } else {
+            $m = [regex]::Match($pn, '^(.*?\.exe)(\s+(.*))?$', 'IgnoreCase')
+            if ($m.Success) { $exe = $m.Groups[1].Value; $svcArgs = $m.Groups[3].Value }
+            else { $exe = $pn }
+            if ($exe -and $exe -match '\s') { $unquoted = $true }
+          }
+        }
+        [ordered]@{
+          name         = $s.Name
+          state        = "$($s.State)"
+          display_name = $s.DisplayName
+          path         = $exe
+          args         = $svcArgs
+          start_type   = "$($s.StartMode)"
+          account      = $s.StartName
+          unquoted     = [bool]$unquoted
+        }
+      }
+      $out
+  register: reg_services
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record services collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['services'] }}"
+  when: reg_services is failed

@@ -1,0 +1,67 @@
+---
+# tasks/systemd_units.yml — L6 systemd units, timers & drop-ins
+# (CONTRACTS §3.1 `systemd_units`)
+# identity: kind, name | volatile: next_run, last_run | other: enabled_state, file_hash
+# kind: unit | timer | dropin — "this is the modern cron — do not skip" (design L6).
+#
+# list-unit-files gives every unit/timer + its enabled state; unit files living in
+# the admin directory /etc/systemd/system are hashed (vendor files under /usr/lib
+# are covered by the package inventory instead — the admin dir is where drift
+# happens). Timers additionally get their (volatile) next/last trigger times via
+# `systemctl show`. Drop-in overrides (*.d/*.conf) are hashed as kind=dropin.
+# Record types, merged into one item list by the snapshot template:
+#   uf | kind | name | enabled_state | file_hash
+#   tr | name | next_run | last_run
+#   di | relative_name | file_hash
+
+- name: L6 collect systemd unit files, timers and drop-ins (read-only)
+  ansible.builtin.shell: |
+    set -u
+    US=$(printf '\037')
+    command -v systemctl >/dev/null 2>&1 || exit 0
+
+    systemctl list-unit-files --no-legend --no-pager 2>/dev/null \
+      | while IFS= read -r line; do
+          name=$(printf '%s' "$line" | awk '{print $1}')
+          state=$(printf '%s' "$line" | awk '{print $2}')
+          [ -n "$name" ] || continue
+          kind=unit
+          case "$name" in *.timer) kind=timer ;; esac
+          fh=""
+          if [ -f "/etc/systemd/system/$name" ]; then
+            fh=$(sha256sum "/etc/systemd/system/$name" 2>/dev/null | awk '{print $1}')
+          fi
+          printf '%s\n' "uf$US$kind$US$name$US$state$US$fh"
+        done
+
+    systemctl list-unit-files --type=timer --no-legend --no-pager 2>/dev/null \
+      | awk '{print $1}' | while IFS= read -r t; do
+          [ -n "$t" ] || continue
+          nr=$(systemctl show "$t" -p NextElapseUSecRealtime --value 2>/dev/null)
+          lr=$(systemctl show "$t" -p LastTriggerUSec --value 2>/dev/null)
+          printf '%s\n' "tr$US$t$US$nr$US$lr"
+        done
+
+    find /etc/systemd/system -type f -name '*.conf' -path '*.d/*' 2>/dev/null \
+      | LC_ALL=C sort | while IFS= read -r df; do
+          fh=$(sha256sum "$df" 2>/dev/null | awk '{print $1}')
+          printf '%s\n' "di$US${df#/etc/systemd/system/}$US$fh"
+        done
+  args:
+    executable: /bin/sh
+  timeout: "{{ dw_snapshot_linux_hash_timeout | int }}"
+  register: dw_sdunits
+  changed_when: false
+  failed_when: false
+  ignore_errors: true
+  check_mode: false
+  tags: [readonly]
+
+- name: L6 stash systemd unit records
+  ansible.builtin.set_fact:
+    dw_raw_systemd_units: "{{ dw_sdunits.stdout | default('') }}"
+
+- name: L6 mark systemd_units failed
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['systemd_units'] }}"
+  when: (dw_sdunits.rc | default(1)) != 0

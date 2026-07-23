@@ -1,0 +1,76 @@
+---
+# roles/snapshot_network/defaults/main.yml
+#
+# Sane defaults for the read-only network collector. The dw_* engagement
+# variables are normally supplied by group_vars and/or `-e` from bin/driftwatch
+# (CONTRACTS.md §1.5); the fallbacks below only keep the role runnable/lint-clean
+# in isolation and should never be relied on in a real run.
+
+# --- Shared driftwatch variables (CONTRACTS.md §1.5) -------------------------
+dw_engagement: "engagement"
+dw_engagement_dir: "{{ playbook_dir | default('.', true) }}/engagements/{{ dw_engagement }}"
+dw_run_id: "0000-00-00T0000Z"
+dw_snapshot_dir: "{{ dw_engagement_dir }}/snapshots"
+dw_deep: false
+dw_hash_policy: "tiered"
+
+# --- Tier detection ----------------------------------------------------------
+# ansible_network_os values routed to the worked Tier-1 handler (t1_ios.yml).
+# Additional T1 handlers (t1_nxos.yml, t1_eos.yml, t1_junos.yml, ...) follow the
+# same pattern and would extend this map; only the IOS example ships in v1.
+dw_net_t1_ios_os:
+  - "cisco.ios.ios"
+  - "ios"
+
+# Command used to fingerprint a device when ansible_network_os is not declared.
+dw_net_fingerprint_command: "show version"
+
+# Universal Tier-3 config-retrieval ladder (design §4.3). First command that
+# returns usable, non-error output wins and becomes the sanitized device_config.
+dw_net_t3_ladder:
+  - "show running-config"
+  - "show configuration"
+  - "display current-configuration"
+  - "get system status"
+  - "/export"
+
+# --- Config sanitization (design §6 "Config sanitization") -------------------
+# Salt for secret redaction. MUST be stable across runs of the same engagement
+# so that a *changed* secret still changes its redacted hash while an unchanged
+# one does not. Sourced from the engagement vault when present; falls back to the
+# engagement id (stable within an engagement). The raw secret is never stored.
+dw_redaction_salt: "{{ vault_config_redaction_salt | default(dw_engagement, true) }}"
+
+# Volatile lines dropped before hashing/diffing (kept out of the stored .conf).
+# Each entry is an unanchored-search-safe regex; they are OR-joined at runtime.
+dw_net_volatile_patterns:
+  - '^Building configuration'
+  - '^Current configuration'
+  - '^! Last configuration change'
+  - '^! NVRAM config last updated'
+  - '^! No configuration change since last restart'
+  - '^!Time:'
+  - '^# .*(Exported|Time):'
+  - '^ntp clock-period'
+  - '^\s*!\s*$'
+
+# Broad indicator used to keep secret-bearing lines out of human-visible diff
+# text (e.g. config_saved.diff_lines). The device_config sha still detects the
+# underlying change; this only prevents leaking the secret into a rendered diff.
+dw_net_secret_indicator: '(?i)(password|secret| community | key [0-9]|key-string|md5|pre-shared)'
+
+# Secret-redaction rules. Each MUST be a fully line-anchored regex with exactly
+# THREE capture groups: (1) keyword prefix kept verbatim, (2) the secret token
+# replaced by salted-sha256(salt+token), (3) trailing context kept verbatim.
+dw_net_secret_rules:
+  - '^(enable secret (?:\d+ )?)(\S+)(.*)$'
+  - '^(enable password (?:\d+ )?)(\S+)(.*)$'
+  - '^(username \S+ (?:privilege \d+ )?(?:secret|password) (?:\d+ )?)(\S+)(.*)$'
+  - '^(snmp-server community )(\S+)(.*)$'
+  - '^( *password (?:\d+ )?)(\S+)(.*)$'
+  - '^( *key 7 )(\S+)(.*)$'
+  - '^( *key-string 7 )(\S+)(.*)$'
+  - '^( *ntp authentication-key \d+ md5 )(\S+)(.*)$'
+  - '^(tacacs-server key (?:\d+ )?)(\S+)(.*)$'
+  - '^(radius-server key (?:\d+ )?)(\S+)(.*)$'
+  - '^( *ppp chap password (?:\d+ )?)(\S+)(.*)$'

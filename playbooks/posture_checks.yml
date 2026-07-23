@@ -1,0 +1,48 @@
+---
+# posture_checks.yml — OPTIONAL Windows security-posture module (design §4.2 W17, §10).
+#
+# W17 is the "security_posture" category: WDigest UseLogonCredential, LSA RunAsPPL, RDP
+# enabled + NLA, SMBv1 state, Defender state/exclusions. A new Defender exclusion is a
+# favorite attacker move, so this surface is worth a focused look between full runs.
+#
+# This is a display-only pass: it runs ONLY the role's W17 task file (include_role +
+# tasks_from) and prints the per-host posture object. It deliberately does NOT write a
+# snapshot document — a posture-only document under snapshots/<host>/ would look to the
+# diff engine like every other category vanished and poison the temporal lens. The
+# pipeline that feeds the diff engine is snapshot.yml (the full role), driven by
+# `driftwatch collect`; posture drift findings come from that pipeline's policy rules.
+#
+# Read-only guarantee: security_posture.yml is a readonly-tagged win_powershell task from
+# the linted snapshot_windows role; nothing is written to the target or to snapshots/.
+#
+# Runs standalone: ansible-playbook playbooks/posture_checks.yml -i <engagement inventory>
+
+- name: Windows security-posture checks (§4.2 W17)
+  hosts: windows
+  gather_facts: false
+  serial: "20%"
+  any_errors_fatal: false
+  tags: [posture, security_posture]
+  tasks:
+    # The role's category tasks append to this list on failure (assembly contract);
+    # initialise it here since the role's main.yml is intentionally not run.
+    - name: Initialize category-failure tracking
+      ansible.builtin.set_fact:
+        dw_failed_categories: []
+
+    - name: Collect the W17 security_posture category only
+      ansible.builtin.include_role:
+        name: snapshot_windows
+        tasks_from: security_posture
+
+    - name: Security posture per host
+      ansible.builtin.debug:
+        msg: "{{ (reg_security_posture.output | default([]) | first) | default({}) }}"
+      when: reg_security_posture is not failed
+
+    - name: Warn where posture collection failed
+      ansible.builtin.debug:
+        msg: >-
+          security_posture collection FAILED on {{ inventory_hostname }} — see the task
+          error above; the host still appears in the next full snapshot run as usual.
+      when: reg_security_posture is failed

@@ -1,0 +1,185 @@
+{# report.md.j2 — driftwatch per-run report (design §7). Rendered by scripts/report_gen.py.
+   Whitespace discipline for Markdown under trim_blocks+lstrip_blocks: control tags
+   ({% if %}/{% for %}/etc.) sit on their own line so they vanish cleanly; inline
+   decorations use {{ ... if ... else ... }} expressions (never inline {% if %}), which
+   trim_blocks leaves untouched so line breaks survive. #}
+# driftwatch report — {{ engagement }}
+
+- **Run:** `{{ run_id }}`{{ ' · previous run `' + prev_run_id + '`' if prev_run_id else '' }}
+{% if client %}
+- **Client:** {{ client }}
+{% endif %}
+{% if authorized_by %}
+- **Authorized by:** {{ authorized_by }}
+{% endif %}
+- **Generated:** {{ generated_at }}
+- **Findings:** {{ totals.active }} active{{ ', ' + totals.suppressed|string + ' suppressed' if totals.suppressed else '' }} — {{ totals.by_severity.critical }} critical, {{ totals.by_severity.high }} high, {{ totals.by_severity.medium }} medium, {{ totals.by_severity.low }} low, {{ totals.by_severity.info }} info
+
+---
+
+## 1. Run health
+{% set rh = run_health %}
+{% if rh.available %}
+
+| Targeted | Collected | Partial | Unreachable | No transport | T3-only |
+|---:|---:|---:|---:|---:|---:|
+| {{ rh.targeted }} | {{ rh.collected }} | {{ rh.partial }} | {{ rh.unreachable }} | {{ rh.no_transport|length }} | {{ rh.t3_only|length }} |
+
+{% if rh.unreachable or rh.no_transport or rh.t3_only or rh.partial %}
+> Unreachable, no-transport, partial, and T3-only hosts are **authorized but not fully assessed** and are reported as coverage-gap findings below — never silently omitted.
+
+{% endif %}
+{% if rh.unreachable_hosts %}
+- **Unreachable:** {{ rh.unreachable_hosts|join(', ') }}
+{% endif %}
+{% if rh.partial_desc %}
+- **Partial:** {{ rh.partial_desc|join('; ') }}
+{% endif %}
+{% if rh.no_transport %}
+- **No transport (Windows):** {{ rh.no_transport|join(', ') }}
+{% endif %}
+{% if rh.t3_only %}
+- **T3-only (network):** {{ rh.t3_only|join(', ') }}
+{% endif %}
+{% else %}
+
+_No run-status file (`snapshots/_run/{{ run_id }}.json`) was present, so per-host collection status could not be read directly. The figures below are reconstructed from coverage-gap findings; `collected` cannot be determined without the status file._
+
+| Targeted (hosts in findings) | Partial | Unreachable | No transport | T3-only |
+|---:|---:|---:|---:|---:|
+| {{ rh.targeted }} | {{ rh.partial }} | {{ rh.unreachable }} | {{ rh.no_transport|length }} | {{ rh.t3_only|length }} |
+{% endif %}
+
+---
+
+## 2. Executive delta
+{% if delta.prev_available %}
+
+Active finding counts by severity vs previous run `{{ delta.prev_run_id }}` (Δ = this run − previous):
+
+| Severity | This run | Previous | Δ |
+|---|---:|---:|---:|
+{% for r in delta.rows %}
+| {{ r.severity }} | {{ r.current }} | {{ r.previous }} | {{ '%+d'|format(r.delta) }} |
+{% endfor %}
+| **total** | **{{ delta.total_current }}** | **{{ delta.total_previous }}** | **{{ '%+d'|format(delta.total_current - delta.total_previous) }}** |
+{% else %}
+
+No previous run was found, so this is a first-run baseline (no delta). Counts by severity:
+
+| Severity | This run |
+|---|---:|
+{% for r in delta.rows %}
+| {{ r.severity }} | {{ r.current }} |
+{% endfor %}
+| **total** | **{{ delta.total_current }}** |
+{% endif %}
+
+### New this run ({{ delta.new_count }})
+{% if delta.new_this_run %}
+
+Findings first seen in `{{ run_id }}` (`first_seen == {{ run_id }}`), most severe first:
+
+{% for f in delta.new_this_run %}
+- **{{ f.severity_upper }}** · `{{ f.rule }}` · {{ f.headline }} — {{ f.host_count }} host{{ 's' if f.host_count != 1 else '' }} ({{ f.hosts_str }})
+{% endfor %}
+{% else %}
+
+No findings are new this run — every active finding was first seen in an earlier run.
+{% endif %}
+
+---
+
+## 3. Findings by severity
+{% if severity_sections %}
+{% for section in severity_sections %}
+{% for f in section.findings %}
+
+### {{ f.severity_upper }} — {{ f.headline }}{{ ' · NEW' if f.new_this_run else '' }}
+`rule: {{ f.rule }}` · `{{ f.finding_id }}` · {{ f.platform }}/{{ f.category }} · {{ f.change_type }}
+
+Hosts ({{ f.host_scope }}): {{ f.hosts_str }}
+
+```diff
+{% for line in f.change_lines %}
+{{ line }}
+{% endfor %}
+```
+First seen {{ f.first_seen }} · {{ f.lens_labels|join(' · ') }}{{ ' · fleet prevalence ' + f.prevalence_pct if f.prevalence_pct else '' }}
+{% if f.note %}
+_{{ f.note }}_
+{% endif %}
+{% if f.per_host %}
+
+Per-host detail (values diverge across hosts):
+{% for host, after in f.per_host|dictsort %}
+- {{ host }}: `{{ after|tojson }}`
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% else %}
+
+**No active findings this run.** Every category compared clean across the temporal, baseline, fleet-outlier, and policy lenses.
+{% endif %}
+
+---
+
+## 4. Fleet matrix
+{% if matrix.rows and matrix.hosts %}
+
+Findings × hosts — the direct answer to "which machines have which differences." `●` = present, `·` = absent. Hosts are numbered columns:
+
+{% for h in matrix.hosts %}
+{{ loop.index }}. {{ h }}
+{% endfor %}
+
+| Sev | Finding | Rule | {{ range(1, matrix.hosts|length + 1)|join(' | ') }} |
+|---|---|---|{{ (['---:'] * (matrix.hosts|length))|join('|') }}|
+{% for row in matrix.rows %}
+| {{ row.severity }} | `{{ row.finding_id }}` | `{{ row.rule }}` | {{ row.cells_ordered|map('_glyph')|join(' | ') }} |
+{% endfor %}
+{% else %}
+
+No findings to place in the matrix this run.
+{% endif %}
+
+---
+
+## 5. Per-host appendix
+{% if per_host %}
+
+Every active finding touching a given host, for the responder assigned to that box.
+{% for host in per_host %}
+
+### {{ host.host }}{{ ' (' + host.platform + ')' if host.platform else '' }} — {{ host.count }} finding{{ 's' if host.count != 1 else '' }}
+{% set c = host.by_severity %}
+{{ c.critical }} critical · {{ c.high }} high · {{ c.medium }} medium · {{ c.low }} low · {{ c.info }} info
+
+{% for f in host.findings %}
+- **{{ f.severity_upper }}** · `{{ f.rule }}` · {{ f.headline }} · `{{ f.finding_id }}`{{ ' · NEW' if f.new_this_run else '' }}
+{% endfor %}
+{% endfor %}
+{% else %}
+
+No host has any active finding this run.
+{% endif %}
+
+---
+
+## Appendix — Suppressed findings
+{% if suppressed %}
+
+These findings matched an active allowlist entry and are suppressed from the counts above. They are retained here and never dropped (design §6).
+
+{% for f in suppressed %}
+- **{{ f.severity_upper }}** · `{{ f.rule }}` · {{ f.headline }} · `{{ f.finding_id }}` — suppressed by `{{ f.suppressed_by }}`; hosts ({{ f.host_count }}): {{ f.hosts_str }}; first seen {{ f.first_seen }}
+{% endfor %}
+{% else %}
+
+No findings were suppressed this run.
+{% endif %}
+
+---
+
+_Generated by driftwatch report_gen from `findings/{{ run_id }}.ndjson` (canonical output). This Markdown is a rendering; the NDJSON is the source of truth (design §7)._

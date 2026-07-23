@@ -1,0 +1,65 @@
+---
+# W4 connections (CONTRACTS §3.2 `connections`)
+# identity: path, remote_ip, remote_port, proto | volatile: count | other: owner
+#
+# Established TCP only, aggregated to (path, remote_ip, remote_port, proto) with a count;
+# the volatile local ephemeral port is dropped, loopback peers are ignored. Final
+# normalization/aggregation is the control node's job; the role emits the raw aggregate.
+
+- name: "W4 active connections"
+  ansible.windows.win_powershell:
+    depth: 5
+    script: |
+      $Ansible.Changed = $false
+      $ErrorActionPreference = 'Stop'
+
+      $pathById = @{}
+      foreach ($pr in (Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue)) {
+        $ipid = [int]$pr.ProcessId
+        if (-not $pathById.ContainsKey($ipid)) { $pathById[$ipid] = $pr.ExecutablePath }
+      }
+      $ownerById = @{}
+      function Resolve-Owner([int]$procId) {
+        if ($ownerById.ContainsKey($procId)) { return $ownerById[$procId] }
+        $owner = $null
+        try {
+          $pobj = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$procId" -ErrorAction Stop
+          $o = Invoke-CimMethod -InputObject $pobj -MethodName GetOwner -ErrorAction Stop
+          if ($o -and $o.User) { $owner = if ($o.Domain) { "$($o.Domain)\$($o.User)" } else { $o.User } }
+        } catch {}
+        $ownerById[$procId] = $owner
+        return $owner
+      }
+
+      $agg = @{}
+      try {
+        foreach ($c in (Get-NetTCPConnection -State Established -ErrorAction Stop)) {
+          $rip = "$($c.RemoteAddress)"
+          if ($rip -in @('127.0.0.1', '::1')) { continue }
+          $ipid = [int]$c.OwningProcess
+          $path = if ($pathById.ContainsKey($ipid)) { $pathById[$ipid] } else { $null }
+          $rport = [int]$c.RemotePort
+          $key = "$path|$rip|$rport|tcp"
+          if ($agg.ContainsKey($key)) {
+            $agg[$key].count = [int]$agg[$key].count + 1
+          } else {
+            $agg[$key] = [ordered]@{
+              path        = $path
+              remote_ip   = $rip
+              remote_port = $rport
+              proto       = 'tcp'
+              count       = 1
+              owner       = (Resolve-Owner $ipid)
+            }
+          }
+        }
+      } catch {}
+      $agg.Values
+  register: reg_connections
+  ignore_errors: true
+  tags: [readonly]
+
+- name: "Record connections collection failure"
+  ansible.builtin.set_fact:
+    dw_failed_categories: "{{ dw_failed_categories + ['connections'] }}"
+  when: reg_connections is failed
