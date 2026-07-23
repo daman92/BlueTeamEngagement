@@ -34,12 +34,19 @@ ansible_collections/
 .ansible/
 
 # --- Local run artifacts -----------------------------------------------------
-reports/*.html
-reports/*.md
-!reports/.gitkeep
-snapshots/
+# Anchored to the repo root so these runtime dirs are ignored ONLY where tooling
+# actually writes them, NOT inside tests/fixtures/ (whose committed fixtures
+# legitimately mirror these names). A leading "/" anchors to this .gitignore's dir.
+/reports/*.html
+/reports/*.md
+!/reports/.gitkeep
+/snapshots/
 *.log
 !docs/**
+
+# Committed test fixtures are always tracked, even when they mirror ignored
+# runtime dir names (e.g. tests/fixtures/report/engagement/snapshots/_run/).
+!tests/fixtures/**
 
 # --- OS / editor -------------------------------------------------------------
 .DS_Store
