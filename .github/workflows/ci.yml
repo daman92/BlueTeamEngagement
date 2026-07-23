@@ -17,7 +17,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pyyaml
+      # No pip install: PyYAML comes from the committed vendor/python/ via scripts/_vendor.py.
+      # This job doubles as a check that the vendored copy is importable on a clean runner.
       - name: Enforce read-only collector roles
         run: python scripts/lint_readonly.py check --roles-dir roles
 
@@ -28,8 +29,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pyyaml jinja2 pytest
-      - name: Unit tests (engine + scripts)
+      # Install ONLY the dev-only test runner. PyYAML/Jinja2/MarkupSafe are NOT installed —
+      # they resolve from the committed vendor/python/ bundle, so a green run proves the
+      # offline-vendored engine deps are complete and functional on a bare interpreter.
+      - run: pip install pytest==8.4.2
+      - name: Unit tests (engine + scripts, using vendored PyYAML/Jinja2)
         run: python -m pytest tests/ -q
 
   ansible-lint:

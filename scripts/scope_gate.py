@@ -28,6 +28,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import _vendor  # noqa: F401  # puts bundled PyYAML/Jinja2 on sys.path (offline kit)
 import yaml
 
 

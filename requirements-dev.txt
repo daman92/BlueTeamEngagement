@@ -1,0 +1,3 @@
+# driftwatch — development/CI-only dependencies (NOT shipped on the kit, NOT vendored).
+-r requirements.txt
+pytest==8.4.2

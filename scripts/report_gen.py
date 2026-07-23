@@ -28,6 +28,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import _vendor  # noqa: F401  # puts bundled PyYAML/Jinja2 on sys.path (offline kit); yaml/jinja2 are lazy-imported below
 import driftwatch_common as dc
 from fleet_stats import build_matrix, hosts_from
 

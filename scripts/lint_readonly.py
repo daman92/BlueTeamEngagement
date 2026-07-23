@@ -23,6 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import _vendor  # noqa: F401  # puts bundled PyYAML/Jinja2 on sys.path (offline kit)
 import yaml
 
 # Modules that mutate a target. Legitimate only against localhost (snapshot assembly).

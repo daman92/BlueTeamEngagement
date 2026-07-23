@@ -1,0 +1,11 @@
+# driftwatch — control-node Python runtime dependencies.
+#
+# Pinned EXACTLY (reproducible kit image; design §15.4). These three pure-Python
+# packages are also VENDORED into vendor/python/ so the engine imports with NO pip
+# and NO PyPI access on an air-gapped client network. scripts/_vendor.py adds that
+# directory to sys.path as a fallback; a real install still wins.
+#
+# Rebuild the vendored copy after bumping a pin:  bin/vendor-deps python
+PyYAML==6.0.3
+Jinja2==3.1.6
+MarkupSafe==3.0.3

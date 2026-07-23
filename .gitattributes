@@ -2,7 +2,7 @@
 # config here runs on the Linux kit control node. A stray CR in the operator
 # console shebang or in a systemd unit is a silent, painful failure, so pin these
 # file types to LF in the working tree regardless of the checkout platform.
-bin/driftwatch      text eol=lf
+bin/*               text eol=lf
 *.sh                text eol=lf
 *.py                text eol=lf
 *.yml               text eol=lf

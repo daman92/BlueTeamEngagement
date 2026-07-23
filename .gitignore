@@ -33,6 +33,14 @@ collections/
 ansible_collections/
 .ansible/
 
+# --- Vendored dependencies ---------------------------------------------------
+# vendor/python/ IS committed (small pure-Python engine deps: PyYAML/Jinja2/MarkupSafe)
+# so the tooling runs offline. The heavy offline bundle for the KIT IMAGE
+# (collection tarballs + pip wheels, 100s of MB, built by bin/vendor-deps) is NOT.
+vendor/wheels/
+vendor/collections/
+vendor/ansible/
+
 # --- Local run artifacts -----------------------------------------------------
 # Anchored to the repo root so these runtime dirs are ignored ONLY where tooling
 # actually writes them, NOT inside tests/fixtures/ (whose committed fixtures

@@ -75,9 +75,12 @@ Client data — snapshots, findings, credentials, evidence — lives **only** un
 ## Quick start (control node / kit, Linux)
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install pyyaml jinja2 pytest ansible-core
-ansible-galaxy collection install -r requirements.yml
+# Set up Ansible + collections. Online, or --offline from the baked-in bundle (see below).
+bin/bootstrap                 # online: .venv + pip + ansible-galaxy
+# bin/bootstrap --offline     # air-gapped: install only from vendor/wheels + vendor/collections
+
+# The Python ENGINE needs no venv at all — PyYAML/Jinja2 are vendored under vendor/python/,
+# so `python scripts/diff_engine.py ...` runs on a bare Python 3.11+ with no pip/internet.
 
 # 1. Stand up an engagement from the template, then edit scope.yml
 bin/driftwatch new-engagement acme-2026-07
@@ -98,10 +101,26 @@ bin/driftwatch ship --splunk      # optional: findings to Splunk, everything to 
 bin/driftwatch teardown           # default: shred everything except the report; vault always shredded
 ```
 
+## Dependencies & the offline kit
+
+The kit deploys onto client networks that are frequently air-gapped, so dependencies
+travel *with* it — nothing is fetched from the internet in the field.
+
+| Dependency | How it's bundled |
+|---|---|
+| Engine deps — PyYAML, Jinja2, MarkupSafe | **Vendored into git** at `vendor/python/` (pure-Python, ~880 KB). `scripts/_vendor.py` puts them on `sys.path`, so the engine runs on a bare interpreter. Pinned in `requirements.txt`. |
+| Ansible core + Galaxy collections | Pinned in `requirements.yml`. Not in git (100s of MB); `bin/vendor-deps bundle` downloads them into `vendor/wheels/` + `vendor/collections/` for the **kit image** to bake, and `bin/bootstrap --offline` installs from there with no network. |
+| OS packages — krb5, chrony | Baked into the kit image (design §3.1); see [systemd/README.md](systemd/README.md). |
+
+Rebuild the vendored Python deps after bumping a pin: `bin/vendor-deps python`.
+CI installs *only* `pytest` and runs the suite against the vendored `yaml`/`jinja2` — a
+green run proves the offline bundle is complete on a clean interpreter.
+
 ## Development
 
 ```bash
-python -m pytest tests/ -q                          # unit tests
+pip install -r requirements-dev.txt                 # pytest + pinned engine deps (dev only)
+python -m pytest tests/ -q                           # unit tests
 python scripts/lint_readonly.py check --roles-dir roles   # security lint (must pass)
 ```
 
