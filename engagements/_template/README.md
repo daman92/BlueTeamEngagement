@@ -79,8 +79,10 @@ template by hand. Then:
    `baseline promote <host> <run_id>`; suppress confirmed known-good findings
    with expiring entries under the repo-level `allowlists/`.
 
-7. **Teardown.** At close-out, `bin/driftwatch teardown [--retain ...]` exports
-   what the retention profile keeps, then shreds the rest. The vault and its key
+7. **Teardown.** At close-out, `bin/driftwatch teardown [--retain ...]` keeps
+   what the retention profile names (default: the report; `audit.log` and
+   `scope.yml` are always kept) and shreds the rest — export anything you are
+   retaining to your designated store *before* it runs. The vault and its key
    are **always** shredded, regardless of profile (design §15.4). Rebuild the
    kit from image before the next engagement.
 

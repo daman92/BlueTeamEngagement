@@ -26,6 +26,14 @@ sudo chown -R driftwatch:driftwatch /opt/driftwatch
 sudo -u driftwatch ansible-galaxy collection install -r /opt/driftwatch/requirements.yml -p /opt/driftwatch/collections
 ```
 
+The transports also need OS packages that belong in the kit **image**, not this repo:
+`krb5-user`/`krb5-workstation` (kinit/klist for Kerberos-over-WinRM) and `chrony` (the
+preflight clock-skew gate) — design §3.1. On an air-gapped kit, replace the
+`ansible-galaxy` step above with the bundled flow: run `bin/vendor-deps` on an
+internet-connected build host (fills `vendor/wheels` + `vendor/collections`), bake the
+result into the image, then `bin/bootstrap --offline` installs Ansible and the
+collections from that bundle with no network access.
+
 ## 2. Select the active engagement
 
 The units read `/etc/driftwatch/engagement.env`. This is the single switch that points the

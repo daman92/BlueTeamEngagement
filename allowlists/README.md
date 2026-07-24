@@ -50,8 +50,8 @@ finding that happens to share a field value.
 2. Add an entry to a reviewed `*.yml` (a PR/commit review, like a code change),
    with a real `expires`, `approver`, and `ticket`.
 3. The finding shows as suppressed from the next run on.
-4. Entries expire on their own. The report's "expiring soon / expired" section
-   (design §8) surfaces them for re-review — re-confirm and re-date, or let it
+4. Entries expire on their own. Each `diff` run warns about every expired (or
+   missing-expiry) entry as it ignores it — re-confirm and re-date, or let it
    lapse and the finding returns to the active set. Do not blanket-extend.
 
 ## What does NOT belong here

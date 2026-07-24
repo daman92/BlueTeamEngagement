@@ -1,5 +1,7 @@
 # driftwatch — Blue-Team Baseline & Drift Detection
 
+[![driftwatch-ci](https://github.com/daman92/BlueTeamEngagement/actions/workflows/ci.yml/badge.svg)](https://github.com/daman92/BlueTeamEngagement/actions/workflows/ci.yml)
+
 An agentless, read-only framework that collects point-in-time security snapshots from
 every host and network device in an engagement, normalizes them into a canonical JSON
 format, and compares them through four lenses to answer, per finding, **which machines
@@ -10,11 +12,12 @@ an in-kit SIEM (Security Onion + Splunk), deployed onto networks you don't own w
 credentials handed to you on arrival. See [docs/design.md](docs/design.md) for the full
 design and [docs/CONTRACTS.md](docs/CONTRACTS.md) for the exact schemas and interfaces.
 
-> Status: v0.1 scaffold. The control-node engine (scope gate, normalizer, diff engine,
-> read-only lint) is implemented and unit-tested; Ansible roles, reporting, SIEM shipping,
-> the operator CLI, and the response layer are generated against the contract. Nothing
-> here has run against a live fleet — treat every playbook as needing a lab shakedown
-> before an engagement.
+> Status: v0.1, built and reviewed. The engine and every component (scope gate, normalizer,
+> diff engine, reporting, SIEM shipping, operator CLI, response layer, read-only lint) are
+> implemented and reviewed for contract conformance; the 85-test suite and the read-only
+> lint run green in CI, and dependencies are vendored for offline use. **Nothing here has
+> run against a live fleet** — treat every playbook as needing a lab shakedown before an
+> engagement.
 
 ## The four lenses
 
@@ -48,7 +51,11 @@ lenses is **one** finding whose `comparison` list records every lens that saw it
 ## Layout
 
 ```
-bin/driftwatch          operator console (collect / diff / report / ship / respond / teardown)
+bin/
+  driftwatch            operator console (new-engagement / preflight / collect / diff /
+                          report / ship / baseline / respond / status / teardown)
+  bootstrap             stand up the Ansible env (.venv + collections), online or --offline
+  vendor-deps           build the offline dependency bundles (see Dependencies below)
 playbooks/              preflight, snapshot, snapshot_network, diff_report, posture_checks
 roles/snapshot_*        agentless collection (linux / windows / ad / network)
 scripts/                control-node engine (Python 3.11, stdlib + PyYAML + Jinja2)
@@ -56,17 +63,20 @@ scripts/                control-node engine (Python 3.11, stdlib + PyYAML + Jinj
   scope_gate.py           authorization rail: inventory gen + fail-closed pre-flight gate
   normalize.py            canonicalize: sort, strip volatile, tag collector-self
   diff_engine.py          four lenses -> findings NDJSON
-  report_gen.py           Markdown/HTML report from findings
+  report_gen.py           Markdown/HTML report from findings (templates in templates/)
   fleet_stats.py          findings x hosts matrix
   siem_ship.py            Splunk (findings) + Security Onion (findings + snapshots)
   baseline.py             promote a snapshot to golden
   lint_readonly.py        the read-only security lint
+  _vendor.py              sys.path shim: engine deps resolve from vendor/python/
 rules/                  policy_checks.yml, severity_map.yml, normalize_patterns.yml
 allowlists/             expiring, reviewed suppressions
 engagements/            per-engagement encrypted volumes (only _template is tracked)
 response/               SEPARATE privilege domain: Tier-1 reversible plays, human-gated
 systemd/                fast / deep / network collection timers
 tests/                  pytest — engine + scripts (no network, no ansible execution)
+docs/                   design.md (the why) + CONTRACTS.md (the interop contract)
+vendor/python/          committed pure-Python engine deps (PyYAML/Jinja2/MarkupSafe)
 ```
 
 Client data — snapshots, findings, credentials, evidence — lives **only** under
@@ -95,7 +105,7 @@ bin/driftwatch preflight
 bin/driftwatch collect            # fast set; add --deep for hashing/packages/cert stores
 bin/driftwatch diff               # normalize + four-lens diff -> findings NDJSON
 bin/driftwatch report             # Markdown + HTML into reports/
-bin/driftwatch ship --splunk      # optional: findings to Splunk, everything to Security Onion
+bin/driftwatch ship               # optional: to Splunk / Security Onion, per scope.yml settings
 
 # 4. Close out
 bin/driftwatch teardown           # default: shred everything except the report; vault always shredded
@@ -108,8 +118,8 @@ travel *with* it — nothing is fetched from the internet in the field.
 
 | Dependency | How it's bundled |
 |---|---|
-| Engine deps — PyYAML, Jinja2, MarkupSafe | **Vendored into git** at `vendor/python/` (pure-Python, ~880 KB). `scripts/_vendor.py` puts them on `sys.path`, so the engine runs on a bare interpreter. Pinned in `requirements.txt`. |
-| Ansible core + Galaxy collections | Pinned in `requirements.yml`. Not in git (100s of MB); `bin/vendor-deps bundle` downloads them into `vendor/wheels/` + `vendor/collections/` for the **kit image** to bake, and `bin/bootstrap --offline` installs from there with no network. |
+| Engine deps — PyYAML, Jinja2, MarkupSafe | **Vendored into git** at `vendor/python/` (pure-Python, ~1.7 MB). `scripts/_vendor.py` puts them on `sys.path`, so the engine runs on a bare interpreter. Pinned in `requirements.txt`. |
+| Ansible core + Galaxy collections | Collections pinned in `requirements.yml`; ansible-core version-constrained by `bin/vendor-deps`. Not in git (100s of MB); `bin/vendor-deps bundle` downloads them into `vendor/wheels/` + `vendor/collections/` for the **kit image** to bake, and `bin/bootstrap --offline` installs from there with no network. |
 | OS packages — krb5, chrony | Baked into the kit image (design §3.1); see [systemd/README.md](systemd/README.md). |
 
 Rebuild the vendored Python deps after bumping a pin: `bin/vendor-deps python`.

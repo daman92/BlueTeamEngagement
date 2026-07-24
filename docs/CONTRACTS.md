@@ -15,6 +15,7 @@ Python components MUST import from it rather than re-declaring specs.
 
 ```
 bin/driftwatch                  # operator console (bash, runs on the Linux kit)
+bin/{bootstrap,vendor-deps}     # env setup (.venv/collections; --offline) + offline dep bundler
 playbooks/{preflight,snapshot,snapshot_network,diff_report,posture_checks}.yml
 roles/{snapshot_linux,snapshot_windows,snapshot_ad,snapshot_network}/
 scripts/                        # control-node Python (3.11+), no deps beyond PyYAML+Jinja2
@@ -25,6 +26,10 @@ systemd/                        # timer + service units (installed on the kit)
 engagements/<engagement_id>/    # ALL client data lives here (see 1.2)
 response/                       # separate privilege domain (separate repo in production)
 tests/                          # pytest; fixtures under tests/fixtures/<component>/
+vendor/python/                  # committed pure-Python PyYAML/Jinja2/MarkupSafe; scripts/_vendor.py
+                                #   puts it on sys.path so the engine runs on a bare Python 3.11+
+requirements.txt                # pinned engine deps (source for vendor/python)
+requirements-dev.txt            # dev/test tooling (pytest, lint)
 ```
 
 ### 1.2 Engagement volume layout (created by `driftwatch new-engagement`)
@@ -44,6 +49,7 @@ engagements/<engagement_id>/
 ├── cases/c-NNNN.json
 ├── evidence/<case_id>/
 ├── reports/<run_id>.{md,html}
+├── audit/                           # ansible-run.log + hostlogs/ (ansible output = engagement data)
 └── audit.log                        # append-only; every run, every scope denial
 ```
 
@@ -80,7 +86,7 @@ oob_subnets: []                 # devices NOT in these are assumed in-band (§13
 settings:
   hash_policy: tiered           # full | tiered | servers_only
   collector_account: svc-driftwatch    # tagged collector_self by the normalizer
-  outlier_max_prevalence: 0.05  # fleet-outlier: item on <5% ...
+  outlier_max_prevalence: 0.05  # fleet-outlier: item on <=5% ...
   outlier_min_group: 20         #   ... of a group with >=20 members
   fast_interval: 2h             # informational; systemd units read these
   deep_interval: 24h
@@ -105,6 +111,7 @@ appends to audit.log).
 | `dw_snapshot_dir` | `{{ dw_engagement_dir }}/snapshots` |
 | `dw_deep` | bool — include deep/expensive categories (hashing, packages, cert stores) |
 | `dw_hash_policy` | `full` / `tiered` / `servers_only` |
+| `dw_transport_matrix` | path to `preflight/transport_matrix.json` (passed by `collect`) |
 
 Roles write **nothing to targets**. Each category task registers results; a final
 `assemble` task builds the full snapshot dict and writes it with `ansible.builtin.copy`
@@ -234,7 +241,7 @@ The authoritative machine-readable table is `CATEGORY_SPECS` in
 |---|---|---|---|---|
 | `device_config` | object | — | — | sha256, line_count, config_path (relative to engagement dir), tier |
 | `config_saved` | object | — | — | in_sync (bool), diff_lines (list) |
-| `change_provenance` | object | — | — | last_change_user, last_change_time, entries (list, most recent first) |
+| `change_provenance` | object | — | entries | last_change_user, last_change_time — entries (list, most recent first) is VOLATILE |
 | `local_accounts` | array | username | — | privilege, secret_hash (salted — never the secret) |
 | `aaa` | object | — | — | method_lists (dict), tacacs_servers (sorted), radius_servers (sorted) |
 | `mgmt_services` | array | service | — | enabled, detail — service: `telnet`\|`http`\|`https`\|`ssh`\|`vty_acl`\|... |
@@ -255,7 +262,7 @@ The authoritative machine-readable table is `CATEGORY_SPECS` in
 
 Object categories diff key-by-key (recursive; canonical-JSON compare per top-level key);
 each differing key produces one `changed` finding. Keys listed as VOLATILE in the spec
-(`l2_state.mac_count_per_vlan`) are stripped first.
+(`l2_state.mac_count_per_vlan`, `change_provenance.entries`) are stripped first.
 
 ---
 
@@ -297,8 +304,11 @@ each differing key produces one `changed` finding. Keys listed as VOLATILE in th
 - `rule` attribute: `drift.<platform>.<category>` for pure drift; upgraded to a policy
   rule's id (`policy.<platform>.<rule_name>`) when a policy rule matches the same item;
   `coverage.<gap_kind>` for coverage gaps (`host_unreachable`, `partial_snapshot`,
-  `category_failed`, `no_transport`, `not_assessed`, `t3_only`).
+  `category_failed`, `no_transport`, `t3_only`).
 - `comparison` values: `temporal`, `baseline`, `fleet_outlier`, `policy`.
+- `detail.prevalence` and `detail.note` are present only when set; when the merged hosts'
+  `after` values diverge, `detail.per_host` = {host: after} is added alongside the shared
+  `after`.
 - Suppressed findings stay in the NDJSON (`suppressed: true`) and render in a report
   appendix — never dropped.
 
@@ -313,8 +323,8 @@ rules:
     category: persistence
     severity: critical
     description: "/etc/ld.so.preload exists"
-    match:                       # fires once per matching ITEM (array cats)
-      all:                       #   or per OBJECT KEY (object cats, use field: <dot.path>)
+    match:                       # fires once per matching ITEM (array cats) or once for the
+      all:                       #   WHOLE OBJECT (object cats, identity {"key": "<category>"})
         - {field: mechanism, op: eq, value: ld_so_preload}
         - {field: present, op: eq, value: true}
 ```
@@ -347,9 +357,10 @@ entries:
     reason: "Chrome updater churns its own scheduled task"
     approver: analyst-b
     ticket: ACME-142
-    expires: "2026-08-15"        # REQUIRED; expired entries are ignored + warned about
+    expires: "2026-08-15"        # REQUIRED; missing or expired entries are ignored + warned about
     scope: {hosts: [], groups: [win_workstations]}    # empty = all
     match:                       # same DSL as policy rules, applied to detail.identity+after
+                                 #   (plus synthetic `category` and `platform` fields)
       all:
         - {field: category, op: eq, value: scheduled_tasks}
         - {field: task_path, op: regex, value: '^\\GoogleUpdateTask'}
@@ -360,19 +371,20 @@ entries:
 
 ## 6. Script CLIs (control node)
 
-All Python scripts: stdlib + PyYAML + Jinja2 only; Python 3.11+; importable (logic in
-functions, `main(argv)` entry, thin `if __name__` shim); exit 0 ok / 1 error / 2 refusal.
+All Python scripts: stdlib + PyYAML + Jinja2 only (vendored under `vendor/python`, put on
+sys.path by `scripts/_vendor.py`); Python 3.11+; importable (logic in functions,
+`main(argv)` entry, thin `if __name__` shim); exit 0 ok / 1 error / 2 refusal.
 
 | Script | Interface |
 |---|---|
-| `scope_gate.py` | `generate\|check\|assert-run --engagement-dir D [--ip IP] [--targets-file F]` |
-| `normalize.py` | `normalize --engagement-dir D --run-id R [--host H]`; library: `canonicalize(doc) -> doc` |
-| `diff_engine.py` | `run --engagement-dir D --run-id R [--rules-dir rules/] [--allowlists-dir allowlists/]` → writes `findings/<run_id>.ndjson`; library: `diff_documents(prev, cur)`, `policy_check(doc, rules)`, `fleet_outliers(docs, groups, settings)` |
+| `scope_gate.py` | `generate\|check\|assert-run --engagement-dir D [--ip IP] [--targets-file F] [--operator NAME]` |
+| `normalize.py` | `normalize --engagement-dir D --run-id R [--host H] [--rules-dir rules/]`; library: `canonicalize(doc, patterns=None, collector_account=None) -> doc` |
+| `diff_engine.py` | `run --engagement-dir D --run-id R [--rules-dir rules/] [--allowlists-dir allowlists/]` → writes `findings/<run_id>.ndjson`; library: `diff_documents(prev, cur, lens)`, `policy_check(doc, rules)`, `fleet_outliers(docs, groups, settings)`, `assemble(deltas, sev_map, engagement, run_id, state)` |
 | `report_gen.py` | `render --engagement-dir D --run-id R [--format md,html]` → `reports/<run_id>.{md,html}` |
-| `fleet_stats.py` | `matrix --engagement-dir D --run-id R` → findings×hosts grid (stdout + JSON) |
-| `siem_ship.py` | `ship --engagement-dir D --run-id R [--splunk] [--elastic]` (reads scope.yml settings; token from env/vault, never argv) |
-| `lint_readonly.py` | `check [--roles-dir roles/]` → exit 2 with violation list if any snapshot role can write to a target |
-| `baseline.py` | `promote --engagement-dir D --host H --run-id R [--ticket T]` — copies snapshot to `baselines/<host>.json` with provenance block |
+| `fleet_stats.py` | `matrix --engagement-dir D --run-id R [--format grid\|json]` → grid (or JSON) to stdout; always writes `reports/<run_id>.matrix.json` |
+| `siem_ship.py` | `ship --engagement-dir D --run-id R [--splunk] [--elastic] [--dry-run]` (reads scope.yml settings; token from env/vault, never argv; `--dry-run` plans without connecting) |
+| `lint_readonly.py` | `check [--roles-dir roles/] [--pattern snapshot_*]` → exit 2 with violation list if any snapshot role can write to a target |
+| `baseline.py` | `promote --engagement-dir D --host H --run-id R [--ticket T] [--note N] [--force] [--operator NAME]` — copies snapshot to `baselines/<host>.json` with provenance block `meta.provenance{promoted_at,promoted_from_run,ticket,note}`; REFUSES a partial snapshot (exit 2) unless `--force` |
 
 `diff_engine` comparison modes per run: temporal (prev vs latest per host), baseline
 (baselines/<host>.json vs latest, if promoted), fleet outlier (per group from
@@ -381,42 +393,51 @@ fleet_groups.json, thresholds from scope.yml settings), policy. Coverage gaps
 `snapshots/_run/<run_id>.json` (written by the CLI after ansible exits: per-host
 ok/partial/unreachable from the play recap).
 
-Collector-self: normalize tags items whose user/owner/account equals
-`settings.collector_account` with `collector_self: true`; diff_engine caps their severity
-at `info` (still reported — hijack of the account stays visible).
+Collector-self: normalize tags items whose user/owner/account/principal/run_as equals
+`settings.collector_account` with `collector_self: true`; diff_engine caps a finding's
+severity at `info` only when EVERY contributing delta is collector-self (still reported —
+hijack of the account stays visible).
 
 ## 7. Response layer (separate privilege domain)
 
 Lives in `response/` (separate repo in production; the boundary here is code/entry-point
 separation per design §15.3). Never imported by collection code.
 
-- Case file `cases/c-NNNN.json`: exactly the design §14 schema
-  (`case_id, engagement, finding, evidence[], proposed_action{tier,play,hosts}, approval{by,at,expires}, result{status,before,after,rolled_back}`).
+- Case file `cases/c-NNNN.json`: the design §14 schema
+  (`case_id, engagement, finding, evidence[], proposed_action{tier,play,hosts}, approval{by,at,expires,authorized_by}, result{status,before,after,rolled_back}`).
+  `approval.authorized_by` is a deliberate addition to §14: `by` = who confirmed in the
+  tool, `authorized_by` = free text naming who authorized it out-of-band.
 - v1 plays (Tier 1 only): `disable_account`, `isolate_host`, `block_hash`,
   `revoke_session` — each: preserve → dry-run (`--check`) → explicit confirm → act → log;
   each takes `case_id` + explicit host list; refuses hosts not named in the case finding.
-- `response/scripts/respond.py`: `propose --case C --play P --hosts H1,H2`,
-  `approve --case C` (interactive confirm; records approver + free-text authorizer),
-  `rollback --case C`.
+- `response/scripts/respond.py`: `propose --case C --play P --hosts H1,H2 [--target T]
+  [--artifact F]...`, `approve --case C [--authorized-by X --confirm]
+  [--approval-ttl-hours N]` (interactive confirm; records approver + free-text authorizer),
+  `rollback --case C`. All verbs take `[--engagement-dir D] [--operator NAME]`
+  (engagement also resolves from `DRIFTWATCH_ENGAGEMENT[_DIR]`).
 - Network-device plays: mandatory rollback timer, in-band warning if target not in
   `oob_subnets` (design §13.5). v1 ships NO network-config-writing plays.
 
 ## 8. CLI verbs (`bin/driftwatch`)
 
-`new-engagement <id>` · `preflight` · `collect [--deep] [--limit PATTERN]` ·
-`diff` · `report` · `ship` · `baseline promote <host> <run_id>` ·
+`new-engagement <id>` · `preflight` · `collect [--deep] [--limit PATTERN] [--collect-only]` ·
+`diff [--run-id R]` · `report [--run-id R]` · `ship [--run-id R]` ·
+`baseline promote <host> <run_id> [--ticket T]` ·
 `respond <propose|approve|rollback> ...` (thin passthrough to response/) ·
-`status` · `teardown [--retain report,findings,...]`
+`status` · `teardown [--retain report,findings,...] [--yes]`
 
-Each verb: resolve engagement → for collect: scope_gate assert-run → run ansible/scripts →
-append one line to `audit.log` (`ISO8601 | verb | run_id | operator | outcome`).
-`teardown` default profile: shred everything except the report; vault ALWAYS shredded.
+Each verb: resolve engagement → for collect/preflight: scope_gate assert-run → run
+ansible/scripts → append one line to `audit.log`
+(`ISO8601 | verb | run_id | operator | outcome`).
+`teardown` default profile: shred everything except the report; vault ALWAYS shredded;
+`audit.log` + `scope.yml` always kept (the operator's authorization record).
 
 ## 9. Testing conventions
 
 - Fixtures: `tests/fixtures/<component>/...`; a small canonical pair of linux snapshots
   (`web01_run1.json`, `web01_run2.json` with seeded drift) lives in
   `tests/fixtures/diff/` and may be reused by other components' tests.
-- Tests import scripts via `tests/conftest.py` (adds `scripts/` to sys.path) —
-  `import diff_engine`, not package paths.
+- Tests import scripts via `tests/conftest.py` (adds `scripts/` and `response/scripts/`
+  to sys.path, and appends `vendor/python` as a fallback so `import yaml` works on a bare
+  interpreter) — `import diff_engine`, not package paths.
 - No network, no ansible execution in tests; pure-Python only.
