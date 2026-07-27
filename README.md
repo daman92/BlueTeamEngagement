@@ -84,6 +84,17 @@ Client data — snapshots, findings, credentials, evidence — lives **only** un
 
 ## Quick start (control node / kit, Linux)
 
+**Get the code onto the kit with `git clone`.** GitHub's "Download ZIP" does not preserve
+the Unix executable bit, so `./bin/driftwatch` fails with *Permission denied* from a ZIP.
+If you must use a ZIP (air-gapped transfer), restore the bit first:
+
+```bash
+chmod +x bin/driftwatch bin/bootstrap bin/vendor-deps
+```
+
+Everything in `bin/` is **bash**, not Python — run `./bin/driftwatch …` (or
+`bash bin/driftwatch …`). Invoking it with `python3` fails while parsing shell syntax.
+
 ```bash
 # Set up Ansible + collections. Online, or --offline from the baked-in bundle (see below).
 bin/bootstrap                 # online: .venv + pip + ansible-galaxy
