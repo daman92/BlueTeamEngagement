@@ -1,0 +1,80 @@
+# driftwatch — build-context filter for deploy/container/Containerfile (podman/buildah).
+#
+# KEEP IN SYNC with Containerfile.dockerignore, which is byte-identical apart from this
+# header. Two files exist because the two runtimes look for two different names and neither
+# can include the other; install.sh verifies both are present before it will build.
+#
+# The Containerfile's COPY allowlist keeps client data out of the image LAYERS. This file
+# keeps it out of the build CONTEXT, which is a separate problem with the same consequence.
+#
+# The context is the repository ROOT, and `engagements/<id>/` lives there: vault, snapshots,
+# findings, evidence, audit logs. Without this filter every build hands that whole tree to
+# the builder — to a root-owned daemon under /var/lib/docker with docker, to a temporary
+# copy with podman. Neither location is reachable by `driftwatch teardown`, which is exactly
+# the argument design §15.4 makes about layers. Excluding it here is the other half of the
+# same control, not a build-speed optimisation.
+#
+# Used explicitly, never by lucky default:
+#   podman:  ./install.sh --mode container   ->  podman build --ignorefile <this file> ...
+#   docker:  the identical sidecar Containerfile.dockerignore, with DOCKER_BUILDKIT=1
+#            forced by install.sh (the legacy builder ignores sidecars and would sweep
+#            engagements/ into the context).
+#
+# Structure mirrors the Containerfile and scope.yml: deny everything, then name what may
+# enter. A path forgotten here fails the build with "COPY failed" — loud and fail-closed —
+# rather than silently carrying a client's credentials into the builder.
+
+# ----------------------------------------------------------------- deny everything first
+*
+
+# ----------------------------------------------------------------- then the allowlist
+# Exactly the sources the Containerfile COPYs, and nothing else. deploy/ is deliberately
+# absent: the image does not ship the container tooling that builds it.
+!requirements.txt
+!requirements.yml
+!ansible.cfg
+!README.md
+!bin
+!scripts
+!playbooks
+!roles
+!rules
+!allowlists
+!inventory
+!systemd
+!docs
+!tests
+!baselines
+!vendor
+!response
+
+# ----------------------------------------------------------------- re-deny, last word wins
+# The response layer is a separate privilege domain (design §7, §14): its CODE ships, its
+# live cases and evidence never do. These lines come after the allowlist because the last
+# matching pattern wins.
+response/cases
+response/evidence
+
+# Belt and braces. None of these are re-included above, so they are already excluded by the
+# leading `*`; they are named so that loosening the allowlist later cannot silently pull a
+# client's data or the operator's keys into a build.
+engagements
+reports
+snapshots
+.git
+.venv
+collections
+**/vault
+**/vault.yml
+**/*.vault
+**/vault_pass*
+**/krb5.conf
+**/*.pem
+**/*.key
+**/id_rsa*
+
+# Build noise: bytecode caches and test/lint state are not inputs to anything.
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache

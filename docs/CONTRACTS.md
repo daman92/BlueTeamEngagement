@@ -14,8 +14,12 @@ Python components MUST import from it rather than re-declaring specs.
 ### 1.1 Repository layout (fixed)
 
 ```
+install.sh                      # one-command control-node setup; COMPOSES bin/bootstrap +
+                                #   bin/vendor-deps, never reimplements them (§8 entry point)
 bin/driftwatch                  # operator console (bash, runs on the Linux kit)
 bin/{bootstrap,vendor-deps}     # env setup (.venv/collections; --offline) + offline dep bundler
+deploy/container/               # OPTIONAL container image (Containerfile + run wrapper);
+                                #   opt-in via `install.sh --mode container`, never required
 playbooks/{preflight,snapshot,snapshot_network,diff_report,posture_checks}.yml
 roles/{snapshot_linux,snapshot_windows,snapshot_ad,snapshot_network}/
 scripts/                        # control-node Python (3.11+), no deps beyond PyYAML+Jinja2
@@ -420,17 +424,59 @@ separation per design §15.3). Never imported by collection code.
 
 ## 8. CLI verbs (`bin/driftwatch`)
 
-`new-engagement <id>` · `preflight` · `collect [--deep] [--limit PATTERN] [--collect-only]` ·
+`doctor [--json]` · `new-engagement [-i|--interactive] <id>` · `preflight` ·
+`collect [--deep] [--limit PATTERN] [--collect-only]` ·
 `diff [--run-id R]` · `report [--run-id R]` · `ship [--run-id R]` ·
 `baseline promote <host> <run_id> [--ticket T]` ·
 `respond <propose|approve|rollback> ...` (thin passthrough to response/) ·
-`status` · `teardown [--retain report,findings,...] [--yes]`
+`gui [--port N] [--no-browser] [--print-url]` · `status` ·
+`teardown [--retain report,findings,...] [--yes]`
 
 Each verb: resolve engagement → for collect/preflight: scope_gate assert-run → run
 ansible/scripts → append one line to `audit.log`
 (`ISO8601 | verb | run_id | operator | outcome`).
 `teardown` default profile: shred everything except the report; vault ALWAYS shredded;
 `audit.log` + `scope.yml` always kept (the operator's authorization record).
+
+`doctor` is the only verb that runs with NO engagement selected (it is the fresh-kit check,
+design Appendix D.3): it always runs the kit/tooling and Windows-transport checks and adds
+the engagement checks when `--engagement`/`$DRIFTWATCH_ENGAGEMENT` names an existing volume.
+Every non-PASS line carries the exact command that fixes it. Exit **0** when there is no
+FAIL (warnings are advisory), **1** when any check FAILs. `--json` writes one JSON object to
+**stdout and nothing else** — `{"checks":[{id,label,status,detail,remediation}...],
+"summary":{"pass":N,"warn":N,"fail":N}}` — with all human output on stderr, so it stays
+parseable on a kit whose python3 is the thing that is broken. It is also the one verb that
+appends to `audit.log` only *conditionally* — there is no volume to append to until an
+engagement is selected.
+
+`new-engagement -i` is the same verb with the scope.yml authored by a prompt/answer wizard
+instead of a template; it produces the identical volume layout (§1.2) and a §1.4-conformant
+`scope.yml` with real values. `<id>` is required without `-i` and optional with it (the
+wizard prompts for it, offering any supplied argument as the default). It is fail-closed by
+construction: it refuses a blank `authorized_by`, requires at least one `in_scope` entry,
+validates every CIDR/IP with the same `ipaddress` module `scope_gate.py` uses, and writes
+NOTHING until the operator confirms the summary — a closed stdin before that point aborts
+with no volume created.
+
+`gui` runs `scripts/gui_server.py serve` — a local operator GUI (dashboard, findings
+browser, fleet matrix, report viewer, scope wizard, audit log). Engagement is optional: the
+GUI selects one, or creates one via the wizard. Its constraints are **contractual, not
+cosmetic**, because this process listens on a kit holding fleet-wide admin credentials
+(design §9, and §13.6's "no web UI for the response layer"):
+
+| Control | Guarantee |
+|---|---|
+| Bind address | `127.0.0.1` only, hard-coded — there is deliberately **no** `--host`/`--bind` flag |
+| Auth | per-run `secrets.token_urlsafe(32)`; every route (including static assets and 404s) requires it, compared with `compare_digest`. First load moves it into an `HttpOnly; SameSite=Strict` cookie and redirects it out of the URL |
+| DNS rebinding | `Host` header allowlisted to `127.0.0.1:<port>` / `localhost:<port>` |
+| CSRF | mutations are POST-only, require the token in an `X-DW-Token` **header** plus same-origin `Origin`/`Referer`; `OPTIONS` returns 405 so no CORS preflight succeeds |
+| XSS | DOM built only via `createElement`/`textContent` (findings carry attacker-controlled strings); the single `el()` builder throws on `innerHTML`/`on*`/unsafe URLs; CSP `default-src 'none'; script-src 'self'`; HTML reports render in `<iframe sandbox>` |
+| Action allowlist | exactly `doctor`, `diff`, `report`, `collect`, `scope-generate`. **No** route exists for respond/approve/rollback, teardown, ship, or any vault/credential path |
+| Path safety | engagement/run ids match anchored (`\Z`) regexes and every path is resolved-parent-checked inside `engagements/` (defeats symlink/junction escape) |
+| Audit | every GUI-triggered action appends the §1.2 `audit.log` line with `via=gui`, plus GUI start/stop |
+
+`collect` is the only allowlisted action that reaches the fleet; the UI flags it as such
+(`reaches_fleet: true`) and confirms before running.
 
 ## 9. Testing conventions
 

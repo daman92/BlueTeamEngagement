@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>driftwatch — operator console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-name">driftwatch</span>
+    <span class="brand-sub">operator console · <span class="local-pill">127.0.0.1 only</span></span>
+  </div>
+  <div class="topbar-controls">
+    <label class="field inline">
+      <span class="field-label">engagement</span>
+      <select id="engagement-picker" aria-label="Engagement"></select>
+    </label>
+    <label class="field inline" id="run-picker-wrap">
+      <span class="field-label">run</span>
+      <select id="run-picker" aria-label="Run"></select>
+    </label>
+    <span class="operator" id="operator-badge"></span>
+  </div>
+</header>
+
+<div id="banner" class="banner" hidden></div>
+
+<div class="shell">
+  <nav class="nav" aria-label="Views">
+    <button class="nav-item" data-view="dashboard" type="button"><span class="nav-key">1</span>Dashboard</button>
+    <button class="nav-item" data-view="findings" type="button"><span class="nav-key">2</span>Findings</button>
+    <button class="nav-item" data-view="matrix" type="button"><span class="nav-key">3</span>Fleet matrix</button>
+    <button class="nav-item" data-view="reports" type="button"><span class="nav-key">4</span>Reports</button>
+    <button class="nav-item" data-view="setup" type="button"><span class="nav-key">5</span>Setup wizard</button>
+    <button class="nav-item" data-view="audit" type="button"><span class="nav-key">6</span>Audit log</button>
+    <div class="nav-foot">
+      <p class="hint"><kbd>/</kbd> search · <kbd>Esc</kbd> close</p>
+      <p class="hint" id="repo-hint"></p>
+    </div>
+  </nav>
+
+  <main class="main">
+    <section id="view-dashboard" class="view" hidden></section>
+    <section id="view-findings" class="view" hidden></section>
+    <section id="view-matrix" class="view" hidden></section>
+    <section id="view-reports" class="view" hidden></section>
+    <section id="view-setup" class="view" hidden></section>
+    <section id="view-audit" class="view" hidden></section>
+  </main>
+</div>
+
+<div id="modal-root" class="modal-root" hidden></div>
+
+<aside id="console" class="console" hidden>
+  <div class="console-head">
+    <span class="console-title" id="console-title">output</span>
+    <span class="console-status" id="console-status"></span>
+    <button type="button" class="btn ghost" id="console-close">close</button>
+  </div>
+  <pre class="console-body" id="console-body" tabindex="0"></pre>
+</aside>
+
+<script src="/app.js"></script>
+<script src="/findings.js"></script>
+<script src="/wizard.js"></script>
+</body>
+</html>

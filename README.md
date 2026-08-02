@@ -51,11 +51,13 @@ lenses is **one** finding whose `comparison` list records every lens that saw it
 ## Layout
 
 ```
+install.sh              one-command control-node setup: check this host -> bootstrap -> self-test
 bin/
-  driftwatch            operator console (new-engagement / preflight / collect / diff /
+  driftwatch            operator console (doctor / new-engagement / preflight / collect / diff /
                           report / ship / baseline / respond / status / teardown)
   bootstrap             stand up the Ansible env (.venv + collections), online or --offline
   vendor-deps           build the offline dependency bundles (see Dependencies below)
+deploy/container/       OPTIONAL container image + hardened run wrapper (opt-in; see below)
 playbooks/              preflight, snapshot, snapshot_network, diff_report, posture_checks
 roles/snapshot_*        agentless collection (linux / windows / ad / network)
 scripts/                control-node engine (Python 3.11, stdlib + PyYAML + Jinja2)
@@ -68,6 +70,7 @@ scripts/                control-node engine (Python 3.11, stdlib + PyYAML + Jinj
   siem_ship.py            Splunk (findings) + Security Onion (findings + snapshots)
   baseline.py             promote a snapshot to golden
   lint_readonly.py        the read-only security lint
+  gui_server.py + gui/    local-only operator GUI (127.0.0.1, stdlib, no external assets)
   _vendor.py              sys.path shim: engine deps resolve from vendor/python/
 rules/                  policy_checks.yml, severity_map.yml, normalize_patterns.yml
 allowlists/             expiring, reviewed suppressions
@@ -84,43 +87,110 @@ Client data — snapshots, findings, credentials, evidence — lives **only** un
 
 ## Quick start (control node / kit, Linux)
 
-**Get the code onto the kit with `git clone`.** GitHub's "Download ZIP" does not preserve
-the Unix executable bit, so `./bin/driftwatch` fails with *Permission denied* from a ZIP.
-If you must use a ZIP (air-gapped transfer), restore the bit first:
-
 ```bash
-chmod +x bin/driftwatch bin/bootstrap bin/vendor-deps
+./install.sh                                    # check this host, set it up, self-test it
+. .venv/bin/activate                            # driftwatch needs ansible* ON PATH
+./bin/driftwatch doctor                         # kit self-check; every non-PASS names its fix
+./bin/driftwatch gui                            # or drive the whole thing from a browser
+./bin/driftwatch new-engagement --interactive   # ...or stay in the terminal: guided scope.yml
+
+# variants: --check (report only, changes nothing; exit 0 ready / 1 not) · --offline (install
+#   only from vendor/wheels + vendor/collections) · --yes (unattended) · --mode container
 ```
 
-Everything in `bin/` is **bash**, not Python — run `./bin/driftwatch …` (or
-`bash bin/driftwatch …`). Invoking it with `python3` fails while parsing shell syntax.
+`install.sh` names what this host is missing in that host's *own* package-manager
+vocabulary, restores the executable bits, hands the venv/pip/collections work to
+`bin/bootstrap`, adds the Windows transport stack, and self-tests the result (read-only
+lint + unit suite). It is idempotent — re-run it freely.
+
+**From a GitHub ZIP, run `bash install.sh`.** "Download ZIP" drops the Unix executable bit,
+so `./install.sh` and `./bin/driftwatch` fail with *Permission denied*; through `bash` it
+runs anyway and restores the bit on itself, on all of `bin/`, and on the container wrapper.
+Everything in `bin/` is **bash**, not Python — `python3 bin/driftwatch …` fails while
+parsing shell syntax.
+
+Or, step by step — `install.sh` composes tools that still stand alone:
 
 ```bash
-# Set up Ansible + collections. Online, or --offline from the baked-in bundle (see below).
-bin/bootstrap                 # online: .venv + pip + ansible-galaxy
-# bin/bootstrap --offline     # air-gapped: install only from vendor/wheels + vendor/collections
-
-# The Python ENGINE needs no venv at all — PyYAML/Jinja2 are vendored under vendor/python/,
-# so `python scripts/diff_engine.py ...` runs on a bare Python 3.11+ with no pip/internet.
-
-# 1. Stand up an engagement from the template, then edit scope.yml
-bin/driftwatch new-engagement acme-2026-07
-$EDITOR engagements/acme-2026-07/scope.yml     # in_scope subnets/hosts, oob_subnets, settings
-
-export DRIFTWATCH_ENGAGEMENT=acme-2026-07
-
-# 2. Verify Windows transport prerequisites (Kerberos DNS/clock/TGT, WinRM/OpenSSH probe)
-bin/driftwatch preflight
-
-# 3. Collect -> diff -> report
-bin/driftwatch collect            # fast set; add --deep for hashing/packages/cert stores
-bin/driftwatch diff               # normalize + four-lens diff -> findings NDJSON
-bin/driftwatch report             # Markdown + HTML into reports/
-bin/driftwatch ship               # optional: to Splunk / Security Onion, per scope.yml settings
-
-# 4. Close out
-bin/driftwatch teardown           # default: shred everything except the report; vault always shredded
+bin/bootstrap                                # online: .venv + pip + ansible-galaxy
+bin/bootstrap --offline                      # air-gapped: vendor/wheels + vendor/collections
+bin/driftwatch new-engagement acme-2026-07   # template scope.yml instead of the wizard
+$EDITOR engagements/acme-2026-07/scope.yml   # authorized_by + in_scope ARE the authorization
 ```
+
+The Python **engine** needs no venv at all — PyYAML/Jinja2 are vendored under
+`vendor/python/`, so `python3 scripts/diff_engine.py …` runs on a bare Python 3.11+ with no
+pip and no internet.
+
+### Running an engagement
+
+```bash
+export DRIFTWATCH_ENGAGEMENT=acme-2026-07                       # or --engagement <id> per verb
+ansible-vault create engagements/acme-2026-07/vault/vault.yml   # handed-over credentials
+
+bin/driftwatch preflight    # Kerberos DNS/clock/TGT + the Windows transport matrix
+bin/driftwatch collect      # scope gate -> snapshot -> diff -> report (--deep, --collect-only)
+bin/driftwatch status       # read-only engagement dashboard
+bin/driftwatch ship         # optional: Splunk / Security Onion, per scope.yml settings
+bin/driftwatch teardown     # shred the volume; report kept by default, vault ALWAYS
+```
+
+`collect` runs `diff` then `report` for you; the standalone verbs re-run those stages on the
+control node against an existing `--run-id`. `doctor` is the only verb that needs no
+engagement selected — given one, it adds the scope / inventory / vault checks.
+
+### The GUI
+
+```bash
+bin/driftwatch gui          # opens http://127.0.0.1:8787 with a one-time token
+```
+
+Dashboard, findings browser (filter by severity/host/category, search, before/after diffs),
+the fleet matrix, report viewer, audit log, and a **setup wizard** that authors `scope.yml`
+with live CIDR/IP validation — a browser alternative to the terminal for everything except
+the dangerous verbs.
+
+It is deliberately constrained, because this listens on a machine holding admin credentials
+for the client's whole fleet (design §9; §13.6 forbids a web UI for the response layer):
+
+- **Loopback only.** Hard-coded `127.0.0.1` — there is no `--host` flag to get wrong.
+- **Token on every request**, moved into an `HttpOnly; SameSite=Strict` cookie on first load;
+  `Host`-header allowlisting blocks DNS rebinding; mutations need the token in a header plus
+  a same-origin check, so no other page you have open can drive it.
+- **No write path.** `respond`/approve, `teardown`, `ship`, and anything touching the vault
+  have no route at all. The only actions are `doctor`, `diff`, `report`, `scope-generate`,
+  and `collect` — which is flagged as fleet-reaching and confirmed before it runs.
+- **Treats findings as hostile input.** Process command lines and cert subjects come from
+  possibly-compromised hosts, so the DOM is built with `textContent`/`createElement` only,
+  under a strict CSP, with HTML reports sandboxed in an iframe.
+- Stdlib + vendored PyYAML, zero external assets — it works air-gapped.
+
+Every GUI-triggered action lands in the engagement's `audit.log` marked `via=gui`.
+
+### Optional: containerized tooling
+
+`deploy/container/` builds an image of the **tooling**, for operators who want the
+control-node dependency set byte-identical between the build host and the kit. It is
+strictly opt-in: the supported default is the native install above, which needs no
+container runtime at all.
+
+```bash
+./install.sh --mode container --check   # is a container runtime present? (podman preferred)
+./install.sh --mode container           # build driftwatch:0.1.0 and driftwatch:latest
+
+# then run any verb through the wrapper (--dry-run prints the command and runs nothing)
+DRIFTWATCH_ENGAGEMENT=acme-2026-07 ./deploy/container/driftwatch-container status
+```
+
+The image holds code and dependencies and **nothing else**: engagement volumes, the vault,
+snapshots and reports live in bind mounts, never in a layer — a layer cannot be shredded at
+teardown (design §15.4), so the teardown guarantee is only true if client data was never
+baked in. It publishes **no ports** and carries no `EXPOSE` line; driftwatch has no web UI,
+and Appendix C.1 already declined to put a listener holding fleet credentials on the kit.
+
+Mounts, the Kerberos and `known_hosts` caveats, what `--network host` means for scope
+layer 3, and air-gapped `save`/`load` transfer:
+[deploy/container/README.md](deploy/container/README.md).
 
 ## Dependencies & the offline kit
 

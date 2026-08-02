@@ -1,0 +1,195 @@
+# driftwatch — OPTIONAL container image for the control-node TOOLING.
+#
+# WHAT THIS IMAGE IS: code + dependencies, pinned, reproducible. Nothing else.
+#
+# WHAT IT MUST NEVER BE: a place client data lives. No engagement volume, no vault, no
+# credentials, no snapshots, no reports may enter a layer. A layer cannot be reliably
+# shredded at teardown (design §15.4) — it survives in the local image store, in every
+# `podman save` tarball, and in any registry the image was ever pushed to. So the file
+# list below is an ALLOWLIST, deliberately mirroring how scope.yml works: nothing enters
+# unless it is named here, and `engagements/` is named nowhere. It exists in the image
+# only as an empty directory to bind-mount over.
+#
+# The build CONTEXT is the repo root, and the repo root is where engagements/ lives. The
+# COPY allowlist below governs what enters a LAYER; it says nothing about what the builder
+# is handed. Always pass the context filter, or the client's vault and snapshots are copied
+# into docker's root-owned storage / podman's temp context, where teardown cannot reach
+# them (design §15.4 again). ./install.sh --mode container does this for you.
+#
+# Build (from the REPO ROOT, which is the build context):
+#   podman build --ignorefile deploy/container/Containerfile.containerignore \
+#     -f deploy/container/Containerfile -t driftwatch:0.1.0 -t driftwatch:latest .
+#   DOCKER_BUILDKIT=1 docker build \
+#     -f deploy/container/Containerfile -t driftwatch:0.1.0 -t driftwatch:latest .
+#       (BuildKit picks up the sidecar Containerfile.dockerignore; the legacy builder does
+#        NOT, which is why install.sh forces DOCKER_BUILDKIT=1.)
+#   ./install.sh --mode container            # does exactly that, with the checks in front
+#
+# Air-gap: BUILD needs network (base image + apt + PyPI/Galaxy). That is expected — build on
+# a connected host and carry the result, exactly like bin/vendor-deps does for the native
+# kit:  podman save -o driftwatch-0.1.0.tar driftwatch:0.1.0
+#
+# See deploy/container/README.md before running this in the field.
+
+# Debian 12 (bookworm) ships Python 3.11 in the base repos, so the engine's 3.11+ floor
+# (CONTRACTS §6) is met without third-party interpreter repos. It is small, current, and
+# has both the krb5 client and its headers packaged.
+#
+# Pin harder for a reproducible kit image (design §15.4) by resolving the digest on the
+# build host and passing it in:
+#   podman build --build-arg BASE_IMAGE=docker.io/library/debian:12-slim@sha256:<digest> ...
+ARG BASE_IMAGE=docker.io/library/debian:12-slim
+
+# ============================================================================ builder
+# The builder holds the compilers and krb5 headers that pywinrm[kerberos] needs to build
+# its GSSAPI binding. None of that reaches the final image: only the finished virtualenv
+# and the resolved Ansible collections are copied forward.
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEBIAN_FRONTEND=noninteractive
+# 1 = install only from the vendored bundle (vendor/wheels + vendor/collections), no PyPI
+# and no Galaxy. Set by `./install.sh --mode container --offline`.
+ARG DW_OFFLINE=0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 \
+      python3-venv \
+      python3-pip \
+      python3-dev \
+      gcc \
+      libc6-dev \
+      libkrb5-dev \
+      krb5-user \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/driftwatch
+
+# --- ALLOWLIST: only code and pinned dependency manifests cross into the build -----------
+# Everything the build needs, named explicitly. `engagements/`, `response/cases/`,
+# `response/evidence/`, `reports/`, `snapshots/`, `.venv/` and any stray krb5.conf or vault
+# are absent by construction, not by an ignore file that someone can forget to update.
+COPY requirements.txt requirements.yml ansible.cfg ./
+COPY bin/            ./bin/
+COPY vendor/         ./vendor/
+
+# bin/bootstrap owns the venv + pip + ansible-galaxy work. The image composes it for the
+# same reason install.sh does: one implementation of "how dependencies get installed",
+# exercised identically on the kit and in the container.
+RUN chmod +x bin/* \
+ && if [ "$DW_OFFLINE" = "1" ]; then bin/bootstrap --offline; else bin/bootstrap; fi
+
+# The Kerberos WinRM stack is an IMAGE concern, not a per-engagement one (design §3.1
+# says so explicitly). bin/bootstrap installs ansible-core; pywinrm[kerberos] is the piece
+# that makes rung 1 of the transport ladder — Kerberos over WinRM-HTTPS — actually work.
+RUN if [ "$DW_OFFLINE" = "1" ]; then \
+        .venv/bin/pip install --no-index --find-links vendor/wheels "pywinrm[kerberos]" ; \
+    else \
+        .venv/bin/pip install "pywinrm[kerberos]>=0.4.3" ; \
+    fi
+
+# Drop the offline bundle before it can be copied forward: vendor/wheels and
+# vendor/collections are hundreds of MB and are already installed by this point.
+# vendor/python STAYS — scripts/_vendor.py resolves the engine's PyYAML/Jinja2 from it, so
+# the Python side keeps running even if the venv is bypassed.
+RUN rm -rf vendor/wheels vendor/collections
+
+# ============================================================================ runtime
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Runtime libraries only — no compiler, no headers.
+#
+# chrony is DELIBERATELY NOT INSTALLED. Kerberos needs the kit within ±5 minutes of the DC
+# (design §3.1) and the clock is a HOST concern: a container shares the host's clock and
+# cannot fix it. Run chrony on the host, against the client's NTP/DC. See README.md.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 \
+      krb5-user \
+      libkrb5-3 \
+      libgssapi-krb5-2 \
+      openssh-client \
+      ca-certificates \
+      git \
+      coreutils \
+      util-linux \
+ && rm -rf /var/lib/apt/lists/*
+# Why each of those: krb5-user gives kinit/klist for the preflight TGT check; libkrb5-3 and
+# libgssapi-krb5-2 are what pywinrm's GSSAPI binding links against; openssh-client is the
+# Linux and network-device transport; git backs the per-engagement tamper-evident snapshot
+# history (design §5); coreutils supplies `shred` for teardown and util-linux supplies
+# `flock`, which keeps two systemd-timer collections from overlapping. Both of the last two
+# are already in the base image — they are listed to record that the kit depends on them.
+
+WORKDIR /opt/driftwatch
+
+# --- ALLOWLIST (runtime): the collector, the engine, and the contracts -------------------
+COPY requirements.txt requirements.yml ansible.cfg README.md ./
+COPY bin/                ./bin/
+COPY scripts/            ./scripts/
+COPY playbooks/          ./playbooks/
+COPY roles/              ./roles/
+COPY rules/              ./rules/
+COPY allowlists/         ./allowlists/
+COPY inventory/          ./inventory/
+COPY systemd/            ./systemd/
+COPY docs/               ./docs/
+COPY tests/              ./tests/
+# baselines/ is PORTABLE reference data only — generic known-good hashes and known-bad
+# IOCs, no client data (CONTRACTS §1.1). Per-engagement baselines live in the engagement
+# volume and are therefore on the far side of the bind mount.
+COPY baselines/          ./baselines/
+# The response layer is a SEPARATE privilege domain (design §7, §14): its code ships, its
+# live cases and evidence never do.
+COPY response/scripts/   ./response/scripts/
+COPY response/playbooks/ ./response/playbooks/
+COPY response/README.md  ./response/README.md
+
+# Built dependencies, without the build toolchain that produced them.
+COPY --from=builder /opt/driftwatch/.venv       ./.venv
+COPY --from=builder /opt/driftwatch/collections ./collections
+COPY --from=builder /opt/driftwatch/vendor      ./vendor
+
+# Mount points and writable state. The image ships them EMPTY:
+#   engagements/  the bind mount for the encrypted engagement volume — the only path any
+#                 client data may occupy, and it is never a layer.
+#   .home/        HOME for the container process: ansible's caches and the ssh known_hosts
+#                 the strict host-key checking in ansible.cfg requires (design §9). The
+#                 wrapper bind-mounts a host directory here so it survives --rm.
+#   response/cases, response/evidence  present so the response layer has somewhere to
+#                 write when the operator mounts a case volume; empty in the image.
+#
+# Ownership, not world-writability. The wrapper runs the container as the HOST operator's
+# uid (podman --userns=keep-id / docker --user), and that uid is not in this image's
+# /etc/passwd — but it does not need to be: under the wrapper every writable path is either
+# a bind mount (whose permissions come from the HOST side) or unwritable anyway, because
+# the wrapper sets --read-only on the root filesystem. So the image-side mode is only ever
+# load-bearing for a bare `podman run driftwatch:latest`, which runs as the declared
+# USER 1000. Owning them by 1000 covers that case exactly; 0777 would only add a
+# world-writable directory to a shipped layer in exchange for nothing.
+RUN mkdir -p engagements .home/.ssh response/cases response/evidence \
+ && chmod +x bin/* \
+ && chown -R 1000:1000 .home engagements response/cases response/evidence \
+ && chmod 0755 .home engagements response/cases response/evidence \
+ && chmod 0700 .home/.ssh
+
+ENV HOME=/opt/driftwatch/.home \
+    PATH=/opt/driftwatch/.venv/bin:/opt/driftwatch/bin:/usr/local/bin:/usr/bin:/bin \
+    ANSIBLE_CONFIG=/opt/driftwatch/ansible.cfg \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Non-root by default. The wrapper overrides this with the operator's own uid so bind-mount
+# ownership lines up; either way nothing in here ever runs as root.
+USER 1000:1000
+
+# NO EXPOSE, ever. There is no web UI and no listener in this project — the whole point of
+# Appendix C.1's "no AWX" decision was to keep a network-listening service holding fleet
+# credentials off the kit. An EXPOSE line here would be the first step back toward one.
+
+# Default to the operator console's own help, so `podman run driftwatch:latest` is a
+# discovery command rather than an accident.
+ENTRYPOINT ["/opt/driftwatch/bin/driftwatch"]
+CMD ["--help"]

@@ -5,7 +5,10 @@
 # response layer stay separate privilege domains that meet only at the case (design §14).
 #
 # Runs on the Linux kit control node. Verbs (CONTRACTS.md §8):
-#   new-engagement <id>            create an engagement volume from the template
+#   doctor [--json]                environment self-check: kit deps, Kerberos prereqs and
+#                                    engagement readiness, each with its fix (design App. D.3)
+#   new-engagement <id> [-i]       create an engagement volume from the template
+#                                    (-i/--interactive: guided, validated scope.yml authoring)
 #   preflight                      Kerberos prereqs + Windows transport matrix
 #   collect [--deep] [--limit P]   scope-gate -> snapshot -> diff -> report
 #   diff [--run-id R]              normalize + diff engine on the control node
@@ -13,6 +16,7 @@
 #   ship [--run-id R]              push findings to the kit SIEM (Splunk/Security Onion)
 #   baseline promote <host> <run_id> [--ticket T]
 #   respond <propose|approve|rollback> ...   thin passthrough to the response layer
+#   gui [--port N] [--no-browser]  local-only (127.0.0.1) operator GUI; no response/teardown
 #   status                         read-only engagement dashboard
 #   teardown [--retain a,b,...]    shred the volume (report kept by default; vault ALWAYS)
 #
@@ -78,10 +82,16 @@ audit() {
     >>"$ENGAGEMENT_DIR/audit.log"
 }
 
-# Read a dotted path out of scope.yml with a default. PyYAML is a control-node dependency.
+# Read a dotted path out of scope.yml with a default. PyYAML is a control-node dependency,
+# but on an air-gapped kit it may only exist as the committed vendor/python copy — so fall
+# back to it exactly like scripts/_vendor.py does. Without this the except-branch below
+# silently hands back the DEFAULT: `collect` would run `tiered` hashing on a scope.yml that
+# says `full` (a real detection gap, Appendix C.2), and SIEM shipping would quietly disable
+# itself. A wrong answer here is worse than a loud failure.
 scope_get() {
-  python3 - "$ENGAGEMENT_DIR/scope.yml" "$1" "${2:-}" <<'PY'
+  python3 - "$ENGAGEMENT_DIR/scope.yml" "$1" "${2:-}" "$REPO_ROOT/vendor/python" <<'PY'
 import sys
+sys.path.append(sys.argv[4])          # offline kit: vendored PyYAML fallback (CONTRACTS §1.1)
 try:
     import yaml
     d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
@@ -340,15 +350,61 @@ settings:
 EOF
 }
 
-cmd_new_engagement() {
-  local id="${1:-}"
-  [ -n "$id" ] || die "usage: $PROG new-engagement <engagement_id>   (format: <client>-<yyyy>-<mm>, e.g. acme-2026-07)"
-  printf '%s' "$id" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?-[0-9]{4}-[0-9]{2}$' \
-    || warn "engagement id '$id' does not match <client>-<yyyy>-<mm> — continuing anyway"
+# Write a scope.yml the wizard has already filled in. Same schema, key order and comment
+# weight as write_scope_template (CONTRACTS §1.4) — the differences are that every value is
+# real (nothing says "CHANGE ME", so the engagement is runnable as written) and that the
+# engagement id is emitted as a QUOTED scalar: the id is operator input here, and a bare
+# plain scalar would let YAML resolve e.g. `yes` to a boolean, which then travels into
+# findings[].engagement (CONTRACTS §4) as the wrong type.
+# args: <path> <id> <client> <authorized_by> <in_scope_block> <deny_block> <oob_block>
+#       <hash_policy> <collector_account>   (the *_block args arrive as rendered YAML)
+write_scope_filled() {
+  local path="$1" id="$2" client="$3" authorized_by="$4"
+  local in_scope_block="$5" deny_block="$6" oob_block="$7"
+  local hash_policy="$8" collector="$9"
+  # Pad the two variable-width settings so their comments land in the same columns as the
+  # template's — this file is read by humans under time pressure on an engagement. The pad
+  # width is one short of the target column plus a LITERAL space, so an over-long value
+  # still leaves the '#' whitespace-separated: `value# comment` is not a YAML comment.
+  local hash_line collector_line
+  hash_line="$(printf '  hash_policy: %-16s # full | tiered | servers_only  (Appendix C.2)' "$hash_policy")"
+  collector_line="$(printf '  collector_account: %-18s # tagged collector_self by the normalizer' "\"$collector\"")"
+  cat >"$path" <<EOF
+# driftwatch engagement scope — THE authorization rail (CONTRACTS.md §1.4, design §15.2).
+# Authored by \`$PROG new-engagement --interactive\` at $(iso_now) by $OPERATOR.
+# Hosts enter the inventory ONLY via in_scope. Fail-closed: an empty in_scope authorizes
+# nothing. After any edit, regenerate the inventory:
+#   python3 scripts/scope_gate.py generate --engagement-dir engagements/$id
+engagement: "$id"
+client: "$client"
+authorized_by: "$authorized_by"   # free text, REQUIRED — names the signed authorization
 
-  local dir="$REPO_ROOT/engagements/$id"
-  [ -e "$dir" ] && die "engagement already exists: $dir"
+in_scope:                       # ONLY source of inventory. CIDRs declare a range; host/ip
+                                # entries become addressable machines. Discovery != access:
+                                # add a discovered host here deliberately before touching it.
+$in_scope_block
 
+$deny_block
+
+$oob_block
+
+settings:
+$hash_line
+$collector_line
+  outlier_max_prevalence: 0.05  # fleet-outlier: item on < 5% ...
+  outlier_min_group: 20         #   ... of a group with >= 20 members
+  fast_interval: 2h             # informational; systemd timers document their own cadence
+  deep_interval: 24h
+  splunk_hec_url: ""            # empty = Splunk shipping disabled
+  splunk_hec_token_var: vault_splunk_hec_token   # NAME of the vault var, never the secret
+  elastic_url: ""              # empty = Security Onion / Elastic shipping disabled
+EOF
+}
+
+# The engagement volume skeleton (CONTRACTS §1.2). Split out of cmd_new_engagement so the
+# non-interactive and interactive paths create byte-identical directory trees.
+create_engagement_volume() {
+  local dir="$1"
   mkdir -p \
     "$dir/inventory" "$dir/vault" "$dir/preflight" \
     "$dir/snapshots/_run" "$dir/configs" "$dir/baselines" \
@@ -356,7 +412,6 @@ cmd_new_engagement() {
     "$dir/audit/hostlogs"
   chmod 700 "$dir/vault"                 # credentials never leave this directory
   : >"$dir/audit.log"
-  write_scope_template "$dir/scope.yml" "$id"
 
   # Per-engagement git repo for tamper-evident snapshot history (design §5). It lives INSIDE
   # the engagement volume (which the root .gitignore excludes), so it is shredded with the
@@ -367,6 +422,33 @@ cmd_new_engagement() {
         && printf 'vault/\n.factcache/\n.retry/\n*.lock\n' >.gitignore \
     ) || warn "per-engagement git init failed (non-fatal — tamper-evidence history unavailable)"
   fi
+}
+
+cmd_new_engagement() {
+  local id="" interactive=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i|--interactive) interactive=true; shift ;;
+      -*)               die "new-engagement: unknown option '$1'" ;;
+      *)                if [ -n "$id" ]; then die "new-engagement: unexpected extra argument '$1'"; fi
+                        id="$1"; shift ;;
+    esac
+  done
+
+  if [ "$interactive" = true ]; then
+    new_engagement_interactive "$id"
+    return 0
+  fi
+
+  [ -n "$id" ] || die "usage: $PROG new-engagement [-i|--interactive] <engagement_id>   (format: <client>-<yyyy>-<mm>, e.g. acme-2026-07)"
+  printf '%s' "$id" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?-[0-9]{4}-[0-9]{2}$' \
+    || warn "engagement id '$id' does not match <client>-<yyyy>-<mm> — continuing anyway"
+
+  local dir="$REPO_ROOT/engagements/$id"
+  [ -e "$dir" ] && die "engagement already exists: $dir"
+
+  create_engagement_volume "$dir"
+  write_scope_template "$dir/scope.yml" "$id"
 
   ENGAGEMENT="$id"; ENGAGEMENT_DIR="$dir"
   audit "new-engagement" "-" "created"
@@ -375,12 +457,337 @@ cmd_new_engagement() {
 
 Next steps:
   1. Edit ${dir#$REPO_ROOT/}/scope.yml — set authorized_by and in_scope (this IS the authorization boundary).
+     (or re-run with --interactive next time and answer the prompts instead)
   2. Load the handed-over credentials into the ephemeral vault:
        ansible-vault create ${dir#$REPO_ROOT/}/vault/vault.yml
   3. Generate the fail-closed inventory from scope:
        python3 scripts/scope_gate.py generate --engagement-dir ${dir#$REPO_ROOT/}
   4. Verify transports (DNS/clock/TGT + WinRM/OpenSSH):
        DRIFTWATCH_ENGAGEMENT=$id $PROG preflight
+EOF
+}
+
+# ---- new-engagement --interactive: the guided path ------------------------------------
+# Prompts go to STDERR and answers are read from STDIN one line at a time, so the wizard
+# behaves identically when stdin is a tty, a pipe or a heredoc — no `read -p`, no readline,
+# no tty requirement. Running out of input is one explicit failure: never a silent default,
+# never a loop.
+ANS=""
+WIZ_ON_EOF="fatal"     # flipped to "default" once the volume exists (nothing to unwind then)
+
+wiz_ask() {
+  local prompt="$1" default="${2:-}"
+  if [ -n "$default" ]; then
+    printf '  %s [%s]: ' "$prompt" "$default" >&2
+  else
+    printf '  %s: ' "$prompt" >&2
+  fi
+  if ! IFS= read -r ANS; then
+    printf '\n' >&2
+    if [ "$WIZ_ON_EOF" = "default" ]; then
+      ANS="$default"
+      warn "end of input — taking the default '$default' for \"$prompt\""
+      return 0
+    fi
+    die "interactive: stdin closed while answering \"$prompt\" — nothing has been written"
+  fi
+  # Trim: a piped answer file may carry CR (CRLF) or padding. An empty answer takes the default.
+  ANS="${ANS#"${ANS%%[![:space:]]*}"}"
+  ANS="${ANS%"${ANS##*[![:space:]]}"}"
+  [ -n "$ANS" ] || ANS="$default"
+  # On a tty the operator's own Enter closes the line; from a pipe nothing is echoed, so
+  # mirror the effective answer to keep the transcript (and any test log) readable.
+  if [ ! -t 0 ]; then printf '%s\n' "$ANS" >&2; fi
+  return 0
+}
+
+wiz_yn() {   # <prompt> <y|n default> — 0 = yes, 1 = no
+  local prompt="$1" default="${2:-n}"
+  while : ; do
+    wiz_ask "$prompt (y/n)" "$default"
+    case "$ANS" in
+      y|Y|yes|Yes|YES) return 0 ;;
+      n|N|no|No|NO)    return 1 ;;
+      *) warn "answer y or n" ;;
+    esac
+  done
+}
+
+# Validate addresses with the SAME ipaddress module scope_gate.py uses, so the wizard can
+# never author a scope.yml that `scope_gate generate` would then reject.
+wiz_valid_net() { python3 -c 'import ipaddress,sys; ipaddress.ip_network(sys.argv[1], strict=False)' "$1" >/dev/null 2>&1; }
+wiz_valid_ip()  { python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.argv[1])' "$1" >/dev/null 2>&1; }
+wiz_valid_host() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$'; }
+
+# "windows, win_servers ad" -> "windows, win_servers, ad" (a YAML flow-list body). Returns
+# non-zero on anything that is not a plain ansible group name, so the caller re-prompts.
+wiz_groups() {
+  local raw="${1//,/ }" out="" g
+  local words=()
+  # Word-split with pathname expansion OFF. An answer of '*' is not a group name and must be
+  # REFUSED; with globbing on, bash would expand it against the operator's cwd and those
+  # filenames would land in the authorization file as ansible groups.
+  local had_noglob=false
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  # shellcheck disable=SC2206  # deliberate split; globbing is disabled for exactly this line
+  words=($raw)
+  [ "$had_noglob" = true ] || set +f
+  for g in ${words[@]+"${words[@]}"}; do
+    printf '%s' "$g" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_-]*$' || return 1
+    if [ -n "$out" ]; then out="$out, $g"; else out="$g"; fi
+  done
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+wiz_dq() {   # escape free text for a YAML double-quoted scalar
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# Everything is collected and confirmed BEFORE anything is written, so an abort — or a
+# closed stdin — leaves no half-built engagement volume and no permissive scope.yml behind.
+new_engagement_interactive() {
+  local id="${1:-}"
+  require_cmds python3
+
+  cat >&2 <<EOF
+
+$PROG new-engagement — guided setup.
+scope.yml is the authorization rail (design §15.2): it is the record of what you were
+permitted to touch, so every answer below lands in the operator's legal evidence. Nothing
+is written until you confirm the summary at the end; Ctrl-C aborts.
+EOF
+
+  # ---- identity
+  local dir="" id_default="$id"
+  while : ; do
+    wiz_ask "engagement id (<client>-<yyyy>-<mm>)" "$id_default"
+    id="$ANS"
+    id_default=""          # a rejected id must never come back as the offered default
+    if [ -z "$id" ]; then warn "an engagement id is required"; continue; fi
+    case "$id" in
+      */*|.|..) warn "'$id' is not usable as a directory name"; continue ;;
+    esac
+    # The id becomes BOTH a directory name and a YAML scalar in scope.yml. Characters
+    # outside this set (': ', '#', quotes, '[', '*', '&') produce a scope.yml that
+    # scope_gate.py refuses to load — and this wizard exists precisely so that cannot
+    # happen. So this one is a refusal, not a warning like the <client>-<yyyy>-<mm> shape.
+    if ! printf '%s' "$id" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+      warn "'$id' has characters outside [A-Za-z0-9._-] (and must start alphanumeric) — the id"
+      warn "  names a directory and a YAML value; anything else breaks scope.yml"
+      continue
+    fi
+    dir="$REPO_ROOT/engagements/$id"
+    if [ -e "$dir" ]; then warn "engagement already exists: engagements/$id — pick another id"; continue; fi
+    printf '%s' "$id" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?-[0-9]{4}-[0-9]{2}$' \
+      || warn "engagement id '$id' does not match <client>-<yyyy>-<mm> — continuing anyway"
+    break
+  done
+
+  local client=""
+  wiz_ask "client legal name" "${id%%-*}"
+  client="$ANS"
+
+  # authorized_by is REQUIRED: design §15.2 derives scope from a signed authorization
+  # document, and a scope.yml that cannot name its authorization is not one.
+  local authorized_by=""
+  while : ; do
+    wiz_ask "authorized_by (name, title, signed SOW reference + date)" ""
+    if [ -n "$ANS" ]; then authorized_by="$ANS"; break; fi
+    warn "authorized_by is REQUIRED — it names the signed authorization this engagement runs under (design §15.2)"
+  done
+
+  # ---- in_scope (at least one entry: an empty in_scope authorizes nothing)
+  cat >&2 <<'EOF'
+
+in_scope — the ONLY source of inventory. A `cidr` entry authorizes a RANGE but makes no
+machine addressable (discovery != access, design §15.2); a `host` entry becomes a machine
+the kit will actually collect from. At least one entry is required.
+EOF
+  local in_scope_block="" scope_summary="" groups=""
+  local n_cidr=0 n_host=0
+  while : ; do
+    local kind=""
+    while : ; do
+      wiz_ask "entry type (cidr/host)" "cidr"
+      case "$ANS" in
+        cidr|CIDR|c) kind="cidr"; break ;;
+        host|HOST|h) kind="host"; break ;;
+        *) warn "answer 'cidr' or 'host'" ;;
+      esac
+    done
+
+    if [ "$kind" = "cidr" ]; then
+      local cidr=""
+      while : ; do
+        wiz_ask "CIDR (e.g. 10.10.0.0/16)" ""
+        if [ -n "$ANS" ] && wiz_valid_net "$ANS"; then cidr="$ANS"; break; fi
+        warn "'$ANS' is not a valid network — expected e.g. 10.10.0.0/16"
+      done
+      while : ; do
+        wiz_ask "ansible groups for this range (comma separated)" "linux"
+        groups="$(wiz_groups "$ANS" || true)"
+        if [ -n "$groups" ]; then break; fi
+        warn "groups must be plain names, e.g. linux, win_servers, network"
+      done
+      in_scope_block="$in_scope_block  - cidr: $cidr"$'\n'"    groups: [$groups]"$'\n'
+      scope_summary="$scope_summary                        range  $cidr  groups: [$groups]"$'\n'
+      n_cidr=$((n_cidr + 1))
+    else
+      local hostname="" hostip=""
+      while : ; do
+        wiz_ask "hostname / FQDN (Kerberos resolves SPNs by name, never by IP — design §3.1)" ""
+        if [ -n "$ANS" ] && wiz_valid_host "$ANS"; then hostname="$ANS"; break; fi
+        warn "'$ANS' is not a valid hostname"
+      done
+      while : ; do
+        wiz_ask "ip for $hostname" ""
+        if [ -n "$ANS" ] && wiz_valid_ip "$ANS"; then hostip="$ANS"; break; fi
+        warn "'$ANS' is not a valid IP address — the scope gate keys off IPs and fails closed without one"
+      done
+      while : ; do
+        wiz_ask "ansible groups for $hostname (comma separated)" "windows"
+        groups="$(wiz_groups "$ANS" || true)"
+        if [ -n "$groups" ]; then break; fi
+        warn "groups must be plain names, e.g. windows, win_servers, ad, crown_jewels"
+      done
+      in_scope_block="$in_scope_block  - host: $hostname"$'\n'"    ip: $hostip"$'\n'"    groups: [$groups]"$'\n'
+      scope_summary="$scope_summary                        host   $hostname ($hostip)  groups: [$groups]"$'\n'
+      n_host=$((n_host + 1))
+    fi
+
+    if ! wiz_yn "add another in_scope entry?" "n"; then break; fi
+  done
+
+  # ---- deny (optional; wins over in_scope)
+  local deny_block="" deny_summary="" n_deny=0
+  if wiz_yn "add explicit deny CIDRs (never-touch; wins over in_scope)?" "n"; then
+    while : ; do
+      wiz_ask "deny CIDR" ""
+      if [ -n "$ANS" ] && wiz_valid_net "$ANS"; then
+        deny_block="$deny_block  - cidr: $ANS"$'\n'
+        if [ -n "$deny_summary" ]; then deny_summary="$deny_summary, $ANS"; else deny_summary="$ANS"; fi
+        n_deny=$((n_deny + 1))
+        if ! wiz_yn "add another deny CIDR?" "n"; then break; fi
+      else
+        warn "'$ANS' is not a valid network — expected e.g. 10.10.99.0/24"
+      fi
+    done
+  fi
+
+  # ---- oob_subnets (optional)
+  cat >&2 <<'EOF'
+
+oob_subnets — management networks reached OUT of band. Everything NOT listed here is
+assumed IN-BAND, which is what makes the response layer warn before it cuts the path it is
+talking over (design §13.5). Leave empty if there is no separate management network.
+EOF
+  local oob_block="" oob_summary="" n_oob=0
+  if wiz_yn "add oob_subnets?" "n"; then
+    while : ; do
+      wiz_ask "oob subnet CIDR" ""
+      if [ -n "$ANS" ] && wiz_valid_net "$ANS"; then
+        oob_block="$oob_block  - $ANS"$'\n'
+        if [ -n "$oob_summary" ]; then oob_summary="$oob_summary, $ANS"; else oob_summary="$ANS"; fi
+        n_oob=$((n_oob + 1))
+        if ! wiz_yn "add another oob subnet?" "n"; then break; fi
+      else
+        warn "'$ANS' is not a valid network — expected e.g. 192.168.99.0/24"
+      fi
+    done
+  fi
+
+  # ---- settings
+  local hash_policy=""
+  while : ; do
+    wiz_ask "hash_policy (full|tiered|servers_only)" "tiered"
+    case "$ANS" in
+      full|tiered|servers_only) hash_policy="$ANS"; break ;;
+      *) warn "hash_policy must be one of: full, tiered, servers_only (Appendix C.2)" ;;
+    esac
+  done
+  local collector=""
+  wiz_ask "collector_account (the handed-over account the kit collects with)" "svc-driftwatch"
+  collector="$ANS"
+
+  # ---- summary + explicit confirmation (nothing has been written yet)
+  cat >&2 <<EOF
+
+--- summary ---------------------------------------------------------------------
+  engagement          : $id
+  client              : $client
+  authorized_by       : $authorized_by
+  in_scope            : $n_cidr range(s), $n_host host(s)
+${scope_summary%$'\n'}
+  deny                : ${deny_summary:-(none)}
+  oob_subnets         : ${oob_summary:-(none — every device is treated as in-band, §13.5)}
+  hash_policy         : $hash_policy
+  collector_account   : $collector
+  volume              : engagements/$id
+----------------------------------------------------------------------------------
+EOF
+  if [ "$n_host" -eq 0 ]; then
+    warn "no host entries: CIDRs authorize the range but make nothing addressable"
+    warn "  (discovery != access, design §15.2) — the generated inventory will be EMPTY until"
+    warn "  you add host/ip entries for the machines you are actually collecting from"
+  fi
+  if ! wiz_yn "write this engagement volume now?" "y"; then
+    die "aborted at the summary — nothing was written"
+  fi
+
+  # ---- write
+  create_engagement_volume "$dir"
+  WIZ_ON_EOF="default"    # the volume exists: a truncated stdin must not abort us mid-way
+
+  # deny/oob render as explicit empty lists when unused: a bare `deny:` parses as null, and
+  # `[]` reads as "considered, nothing to add" rather than "left unfinished".
+  local deny_yaml oob_yaml
+  if [ -n "$deny_block" ]; then
+    deny_yaml="deny:                           # explicit never-touch; wins over in_scope
+${deny_block%$'\n'}"
+  else
+    deny_yaml="deny: []                        # explicit never-touch; wins over in_scope"
+  fi
+  if [ -n "$oob_block" ]; then
+    oob_yaml="oob_subnets:                    # devices NOT in these are assumed in-band (design §13.5)
+${oob_block%$'\n'}"
+  else
+    oob_yaml="oob_subnets: []                 # devices NOT in these are assumed in-band (design §13.5)"
+  fi
+
+  write_scope_filled "$dir/scope.yml" "$id" "$(wiz_dq "$client")" "$(wiz_dq "$authorized_by")" \
+    "${in_scope_block%$'\n'}" "$deny_yaml" "$oob_yaml" "$hash_policy" "$(wiz_dq "$collector")"
+
+  ENGAGEMENT="$id"; ENGAGEMENT_DIR="$dir"
+  audit "new-engagement" "-" "created interactive in_scope=$((n_cidr + n_host)) deny=$n_deny oob=$n_oob authorized_by=set"
+  info "created engagement volume: $dir"
+  info "scope.yml written: ${dir#$REPO_ROOT/}/scope.yml"
+
+  if wiz_yn "generate the fail-closed inventory from this scope now?" "y"; then
+    local rc=0
+    python3 "$SCRIPTS_DIR/scope_gate.py" generate --engagement-dir "$dir" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      warn "scope_gate generate failed (rc=$rc) — fix scope.yml, then re-run:"
+      warn "    python3 scripts/scope_gate.py generate --engagement-dir ${dir#$REPO_ROOT/}"
+    fi
+  else
+    info "inventory not generated — run it before collecting:"
+    info "    python3 scripts/scope_gate.py generate --engagement-dir ${dir#$REPO_ROOT/}"
+  fi
+
+  cat >&2 <<EOF
+
+Next steps:
+  1. Load the handed-over credentials into the ephemeral vault (design §15.3):
+       ansible-vault create ${dir#$REPO_ROOT/}/vault/vault.yml
+  2. Verify transports (DNS/clock/TGT + WinRM/OpenSSH):
+       DRIFTWATCH_ENGAGEMENT=$id $PROG preflight
+  3. Re-check readiness at any point:
+       DRIFTWATCH_ENGAGEMENT=$id $PROG doctor
 EOF
 }
 
@@ -592,14 +999,37 @@ cmd_respond() {
   return "$rc"
 }
 
+# Local-only operator GUI. Deliberately constrained (design §9, §13.6): the server binds
+# 127.0.0.1 and nothing else, requires a per-run token on every request, and exposes NO
+# response/approve, teardown, or credential surface — a kit holding fleet-wide admin creds
+# does not get a web button for the write path. Engagement is optional here: the GUI can
+# pick one (or run the setup wizard) once it is up.
+cmd_gui() {
+  require_cmds python3
+  local gui_py="$SCRIPTS_DIR/gui_server.py"
+  [ -f "$gui_py" ] || die "GUI not installed: $gui_py not found"
+
+  # Pass --engagement through when one is already selected, so the GUI opens on it.
+  local args=()
+  if [ -n "$ENGAGEMENT" ] || [ -n "${DRIFTWATCH_ENGAGEMENT:-}" ]; then
+    args+=(--engagement "${ENGAGEMENT:-$DRIFTWATCH_ENGAGEMENT}")
+  fi
+
+  info "starting the operator GUI on loopback (127.0.0.1) — Ctrl-C to stop"
+  local rc=0
+  python3 "$gui_py" serve ${args[@]+"${args[@]}"} "$@" || rc=$?
+  return "$rc"
+}
+
 cmd_status() {
   resolve_engagement
   require_cmds python3
   local run_id; run_id="$(latest_run_id || true)"
 
-  python3 - "$ENGAGEMENT_DIR" "$ENGAGEMENT" "${run_id:-}" <<'PY'
+  python3 - "$ENGAGEMENT_DIR" "$ENGAGEMENT" "${run_id:-}" "$REPO_ROOT/vendor/python" <<'PY'
 import json, os, sys
 eng_dir, engagement, run_id = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.append(sys.argv[4])          # offline kit: vendored PyYAML fallback (CONTRACTS §1.1)
 
 def load_yaml(path):
     try:
@@ -678,6 +1108,541 @@ PY
 
   info "recent audit.log:"
   tail -n 6 "$ENGAGEMENT_DIR/audit.log" 2>/dev/null || true
+}
+
+# --------------------------------------------------------------------------- doctor
+# Environment self-check. Design Appendix D.3 is explicit that this checklist must be a
+# scripted verb that "fails loudly with specific remediation text, not diagnosed by hand" —
+# so every non-PASS check carries the exact command that fixes it. "Kerberos is broken" is
+# not a diagnosis; "kinit svc-dw@ACME.EXAMPLE" is. Checks probe defensively and NEVER abort
+# the run: a missing tool is a result, not a crash. Exit 1 only when something FAILed.
+DOC_ID=(); DOC_LABEL=(); DOC_STATUS=(); DOC_DETAIL=(); DOC_REMEDY=()
+DOC_PASS=0; DOC_WARN=0; DOC_FAIL=0
+DOC_JSON=false
+DOC_PY=""              # python3 as found by the interpreter check; "" when unusable
+
+# Collapse a value to one line: keeps the human table aligned and keeps --json escaping
+# down to backslash + quote (below). The whole control class goes, not just CR/LF/TAB —
+# detail text can carry an arbitrary byte out of scope.yml or a parser message, and RFC 8259
+# forbids a raw control character inside a JSON string, so one would make --json unparseable.
+_oneline() {
+  local s="${1:-}"
+  s="${s//[[:cntrl:]]/ }"
+  while [ "$s" != "${s//  / }" ]; do s="${s//  / }"; done
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Bash-only JSON escaping: --json must still work on a kit whose python3 is the very thing
+# that is broken.
+_json_escape() {
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+doctor_section() {
+  if [ "$DOC_JSON" = true ]; then return 0; fi
+  printf '\n' >&2
+  _col '1;37'; printf '  %s' "$1" >&2; _col '0'; printf '\n' >&2
+  return 0
+}
+
+doctor_print() {   # <status> <label> <detail> <remediation>
+  local status="$1" label="$2" detail="$3" remedy="$4" tag colour
+  case "$status" in
+    pass) tag="PASS"; colour='0;32' ;;
+    warn) tag="WARN"; colour='0;33' ;;
+    *)    tag="FAIL"; colour='0;31' ;;
+  esac
+  printf '    ' >&2; _col "$colour"; printf '%-4s' "$tag" >&2; _col '0'
+  printf '  %-26s %s\n' "$label" "$detail" >&2
+  if [ -n "$remedy" ]; then
+    printf '          %-26s fix: %s\n' "" "$remedy" >&2
+  fi
+  return 0
+}
+
+doctor_add() {     # <id> <pass|warn|fail> <label> [detail] [remediation]
+  local id="$1" status="$2" label="$3" detail="" remedy=""
+  detail="$(_oneline "${4:-}")"
+  remedy="$(_oneline "${5:-}")"
+  DOC_ID+=("$id"); DOC_STATUS+=("$status"); DOC_LABEL+=("$label")
+  DOC_DETAIL+=("$detail"); DOC_REMEDY+=("$remedy")
+  case "$status" in
+    pass) DOC_PASS=$((DOC_PASS + 1)) ;;
+    warn) DOC_WARN=$((DOC_WARN + 1)) ;;
+    *)    DOC_FAIL=$((DOC_FAIL + 1)) ;;
+  esac
+  if [ "$DOC_JSON" != true ]; then doctor_print "$status" "$label" "$detail" "$remedy"; fi
+  return 0
+}
+
+doctor_emit_json() {
+  local i=0 n="${#DOC_ID[@]}" sep=""
+  printf '{"checks":['
+  while [ "$i" -lt "$n" ]; do
+    printf '%s{"id":"%s","label":"%s","status":"%s","detail":"%s","remediation":"%s"}' \
+      "$sep" \
+      "$(_json_escape "${DOC_ID[$i]}")" \
+      "$(_json_escape "${DOC_LABEL[$i]}")" \
+      "$(_json_escape "${DOC_STATUS[$i]}")" \
+      "$(_json_escape "${DOC_DETAIL[$i]}")" \
+      "$(_json_escape "${DOC_REMEDY[$i]}")"
+    sep=","
+    i=$((i + 1))
+  done
+  printf '],"summary":{"pass":%d,"warn":%d,"fail":%d}}\n' "$DOC_PASS" "$DOC_WARN" "$DOC_FAIL"
+  return 0
+}
+
+# Count existing paths among the globs. An unmatched glob stays literal and counts 0, so
+# this never needs nullglob (which would change behaviour for the rest of the script).
+doctor_count() {
+  local n=0 p
+  for p in "$@"; do
+    if [ -e "$p" ]; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+
+# One-shot scope.yml probe: parse status plus the two fields that decide whether this
+# engagement is authorized to run at all. Emits key=value lines and never fails hard.
+# "PyYAML is missing" and "the YAML is malformed" are reported as DIFFERENT statuses: they
+# have different fixes, and sending an operator to re-indent a perfectly good scope.yml
+# because the interpreter has no yaml module is exactly the hand-diagnosis Appendix D.3
+# says this verb exists to prevent.
+doctor_scope_probe() {
+  "$DOC_PY" - "$1" "$REPO_ROOT/vendor/python" <<'PY' 2>/dev/null || true
+import sys
+sys.path.append(sys.argv[2])          # offline kit: vendored PyYAML fallback (CONTRACTS §1.1)
+try:
+    import yaml
+except Exception as exc:
+    print("parse=nodeps")
+    print("error=%s" % str(exc).replace("\n", " ")[:200])
+    sys.exit(0)
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    if not isinstance(data, dict):
+        raise ValueError("top level is not a mapping")
+except Exception as exc:
+    # PyYAML embeds the stream name in the message; on a long kit path that alone would eat
+    # the 200-char budget and drop the line/column that actually locates the error.
+    print("parse=err")
+    print("error=%s" % str(exc).replace(sys.argv[1], "scope.yml").replace("\n", " ")[:200])
+    sys.exit(0)
+entries = data.get("in_scope") or []
+print("parse=ok")
+print("client=%s" % (data.get("client") or ""))
+print("authorized_by=%s" % (data.get("authorized_by") or ""))
+print("in_scope=%d" % (len(entries) if isinstance(entries, list) else -1))
+PY
+}
+
+doctor_engagement_checks() {
+  local dir="$1" id="$2"
+  local rel="engagements/$id"
+
+  # --- scope.yml: the authorization rail. Everything else is downstream of it (§15.2).
+  if [ ! -f "$dir/scope.yml" ]; then
+    doctor_add scope fail "scope.yml" "missing from $rel — this engagement has no authorization rail" \
+      "restore it from your authorization document, or recreate the volume: $PROG new-engagement -i $id"
+  elif [ -z "$DOC_PY" ]; then
+    doctor_add scope warn "scope.yml" "present, but cannot be parsed without python3" \
+      "fix the python3 check above, then re-run $PROG doctor"
+  else
+    local probe="" parse="" perr="" client="" authorized="" in_scope_n=""
+    probe="$(doctor_scope_probe "$dir/scope.yml")"
+    local key val
+    while IFS='=' read -r key val; do
+      val="${val%$'\r'}"          # tolerate a CRLF-writing interpreter: this output is parsed
+      case "$key" in
+        parse)         parse="$val" ;;
+        error)         perr="$val" ;;
+        client)        client="$val" ;;
+        authorized_by) authorized="$val" ;;
+        in_scope)      in_scope_n="$val" ;;
+      esac
+    done <<EOF
+$probe
+EOF
+
+    if [ "$parse" = "nodeps" ]; then
+      doctor_add scope warn "scope.yml" \
+        "present, but PyYAML will not import here (${perr:-import failed}) — not validated" \
+        "fix the engine deps check above (pip install -r requirements.txt, or restore the offline bundle: bin/vendor-deps python), then re-run $PROG doctor"
+    elif [ "$parse" != "ok" ]; then
+      doctor_add scope fail "scope.yml" "does not parse: ${perr:-unknown YAML error}" \
+        "fix the YAML in $rel/scope.yml (indentation/quoting), then re-run $PROG doctor"
+    else
+      doctor_add scope pass "scope.yml" "parses; client '${client:-(unset)}'"
+
+      case "$authorized" in
+        "")           doctor_add scope_auth fail "scope authorized_by" \
+                        "empty — the scope names no authorization, so no run is defensible (design §15.2)" \
+                        "set authorized_by in $rel/scope.yml to the name, title and signed SOW reference" ;;
+        "CHANGE ME"*) doctor_add scope_auth fail "scope authorized_by" \
+                        "still the template placeholder ('CHANGE ME ...')" \
+                        "set authorized_by in $rel/scope.yml to the name, title and signed SOW reference" ;;
+        *)            doctor_add scope_auth pass "scope authorized_by" "$authorized" ;;
+      esac
+
+      if [ "${in_scope_n:-0}" = "-1" ]; then
+        doctor_add scope_in fail "scope in_scope" "in_scope is not a list — the scope gate cannot read it" \
+          "make in_scope a YAML list of {cidr,groups} / {host,ip,groups} entries in $rel/scope.yml (CONTRACTS §1.4)"
+      elif [ "${in_scope_n:-0}" -gt 0 ] 2>/dev/null; then
+        doctor_add scope_in pass "scope in_scope" "$in_scope_n entr(y/ies) authorized"
+      else
+        doctor_add scope_in fail "scope in_scope" \
+          "EMPTY — an empty in_scope authorizes nothing (fail-closed), so every collect will be refused" \
+          "add cidr/host entries to $rel/scope.yml, then: python3 scripts/scope_gate.py generate --engagement-dir $rel"
+      fi
+    fi
+  fi
+
+  # --- inventory (generated FROM scope; layer 1 of the scope rail)
+  local inv="$dir/inventory/hosts.yml" fg="$dir/inventory/fleet_groups.json"
+  if [ -f "$inv" ] && [ -f "$fg" ]; then
+    local nhosts=""
+    if [ -n "$DOC_PY" ]; then
+      nhosts="$("$DOC_PY" -c 'import json,sys; print(len(json.load(open(sys.argv[1],encoding="utf-8"))))' "$fg" 2>/dev/null || true)"
+      nhosts="${nhosts//[^0-9]/}"   # it is a count or it is nothing
+    fi
+    # "we could not count" is NOT "the count is zero": reporting an unreadable count as an
+    # empty inventory would send the operator off to edit a scope.yml that is already right.
+    if [ -z "$nhosts" ]; then
+      doctor_add inventory warn "inventory generated" \
+        "hosts.yml + fleet_groups.json present, but the host count could not be read here" \
+        "fix the python3 check above (or repair $rel/inventory/fleet_groups.json: python3 scripts/scope_gate.py generate --engagement-dir $rel), then re-run $PROG doctor"
+    elif [ "$nhosts" = "0" ]; then
+      doctor_add inventory warn "inventory generated" \
+        "hosts.yml + fleet_groups.json present but hold 0 hosts (CIDR-only scope declares ranges, not machines)" \
+        "add host/ip entries to $rel/scope.yml, then: python3 scripts/scope_gate.py generate --engagement-dir $rel"
+    else
+      doctor_add inventory pass "inventory generated" "$nhosts host(s) in inventory/hosts.yml"
+    fi
+  elif [ -f "$inv" ] || [ -f "$fg" ]; then
+    doctor_add inventory warn "inventory generated" "partially generated — hosts.yml and fleet_groups.json must both exist" \
+      "python3 scripts/scope_gate.py generate --engagement-dir $rel"
+  else
+    doctor_add inventory warn "inventory generated" "not generated yet — nothing is addressable" \
+      "python3 scripts/scope_gate.py generate --engagement-dir $rel"
+  fi
+
+  # --- vault: creds are injected on arrival and shredded on departure (design §15.3)
+  local vf="$dir/vault/vault.yml"
+  if [ -f "$vf" ]; then
+    if head -n1 "$vf" 2>/dev/null | grep -q 'ANSIBLE_VAULT'; then
+      doctor_add vault pass "engagement vault" "vault/vault.yml present and ansible-vault encrypted"
+    else
+      doctor_add vault fail "engagement vault" \
+        "vault/vault.yml is NOT ansible-vault encrypted — plaintext credentials in the engagement volume" \
+        "ansible-vault encrypt $rel/vault/vault.yml"
+    fi
+  else
+    doctor_add vault warn "engagement vault" "no vault/vault.yml — handed-over credentials not injected yet (design §15.3)" \
+      "ansible-vault create $rel/vault/vault.yml"
+  fi
+
+  # --- artifacts: what this engagement has actually produced so far
+  local n_snap=0 p
+  for p in "$dir"/snapshots/*/*.json; do
+    case "$p" in */_run/*) continue ;; esac
+    if [ -f "$p" ]; then n_snap=$((n_snap + 1)); fi
+  done
+  local n_find n_rep last
+  n_find="$(doctor_count "$dir"/findings/*.ndjson)"
+  n_rep="$(doctor_count "$dir"/reports/*.md)"
+  last="$(latest_run_id || true)"
+  doctor_add artifacts pass "engagement artifacts" \
+    "snapshots:$n_snap findings:$n_find reports:$n_rep last_run:${last:-none}"
+  return 0
+}
+
+cmd_doctor() {
+  local json=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=true; shift ;;
+      *) die "doctor: unknown option '$1'   (usage: $PROG [--engagement <id>] doctor [--json])" ;;
+    esac
+  done
+  DOC_JSON="$json"
+
+  if [ "$DOC_JSON" != true ]; then
+    info "doctor — kit self-check (design Appendix D.3); every non-PASS line carries its fix"
+  fi
+
+  # ======================================================================= kit / tooling
+  doctor_section "kit / tooling"
+
+  local bmaj="${BASH_VERSINFO[0]:-0}"
+  if [ "$bmaj" -ge 4 ] 2>/dev/null; then
+    doctor_add bash pass "bash version" "bash ${BASH_VERSION:-?}"
+  elif [ "$bmaj" -eq 3 ] 2>/dev/null; then
+    doctor_add bash warn "bash version" "bash ${BASH_VERSION:-?} — the kit is developed and tested against bash 4+" \
+      "install a current bash (apt install bash / dnf install bash) and re-run"
+  else
+    doctor_add bash fail "bash version" "not running under a recognised bash (${BASH_VERSION:-unknown})" \
+      "run the console with bash: bash bin/driftwatch doctor"
+  fi
+
+  local kernel="" krel=""
+  kernel="$(uname -s 2>/dev/null || echo unknown)"
+  krel="$(uname -r 2>/dev/null || true)"
+  if [ "$kernel" = "Linux" ]; then
+    doctor_add platform pass "control node OS" "Linux ${krel:-?}"
+  else
+    doctor_add platform warn "control node OS" \
+      "$kernel ${krel:-} — the roles, collections and krb5 tooling target a Linux control node" \
+      "run driftwatch from the Linux kit image (design §15.4); results here are indicative only"
+  fi
+
+  # python3 specifically: every script is invoked as `python3 ...`, so a bare `python` is
+  # not a substitute.
+  local pyver="" pymaj="" pymin=""
+  if command -v python3 >/dev/null 2>&1; then
+    pyver="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || true)"
+    pyver="${pyver//[^0-9.]/}"     # a dotted version or nothing — never a stray CR
+    pymaj="${pyver%%.*}"
+    pymin="${pyver#*.}"; pymin="${pymin%%.*}"
+    if [ "${pymaj:-0}" -gt 3 ] 2>/dev/null || { [ "${pymaj:-0}" -eq 3 ] 2>/dev/null && [ "${pymin:-0}" -ge 11 ] 2>/dev/null; }; then
+      DOC_PY="python3"
+      doctor_add python pass "python3 >= 3.11" "python3 $pyver ($(command -v python3))"
+    elif [ -n "$pyver" ]; then
+      doctor_add python fail "python3 >= 3.11" "python3 $pyver is too old — the engine uses 3.11+ syntax" \
+        "install Python 3.11+ (apt install python3.11 / dnf install python3.11) and put it first on PATH"
+    else
+      doctor_add python fail "python3 >= 3.11" "python3 is on PATH but will not run" \
+        "reinstall python3 (apt install --reinstall python3) and re-run $PROG doctor"
+    fi
+  elif command -v python >/dev/null 2>&1; then
+    doctor_add python fail "python3 >= 3.11" "only 'python' is on PATH — the scripts are invoked as 'python3'" \
+      "install python3 (apt install python3) or symlink it: ln -s \"\$(command -v python)\" /usr/local/bin/python3"
+  else
+    doctor_add python fail "python3 >= 3.11" "not found on PATH" \
+      "install Python 3.11+ (apt install python3 / dnf install python3.11)"
+  fi
+
+  # Engine deps. Installed copies win at runtime (_vendor.py only APPENDS vendor/python to
+  # sys.path), so report which source is actually in use — and warn when the offline
+  # fallback is missing, because air-gapped deployment is a first-class path.
+  local dep_installed=false dep_vendored=false
+  if [ -n "$DOC_PY" ]; then
+    if ( unset PYTHONPATH; "$DOC_PY" -c 'import yaml, jinja2' ) >/dev/null 2>&1; then
+      dep_installed=true
+    fi
+    # The vendored bundle counts as working only if the tree is actually there AND imports
+    # resolve with it on the path — presence alone would pass on an empty directory.
+    if [ -f "$REPO_ROOT/vendor/python/yaml/__init__.py" ] \
+       && [ -f "$REPO_ROOT/vendor/python/jinja2/__init__.py" ] \
+       && ( unset PYTHONPATH; PYTHONPATH="$REPO_ROOT/vendor/python" "$DOC_PY" -c 'import yaml, jinja2' ) >/dev/null 2>&1; then
+      dep_vendored=true
+    fi
+  fi
+  if [ -z "$DOC_PY" ]; then
+    doctor_add engine_deps fail "engine deps (yaml/jinja2)" "not checked — no usable python3" \
+      "fix the python3 check above first"
+  elif [ "$dep_installed" = true ] && [ "$dep_vendored" = true ]; then
+    doctor_add engine_deps pass "engine deps (yaml/jinja2)" "installed (in use) + vendor/python fallback intact"
+  elif [ "$dep_installed" = true ]; then
+    doctor_add engine_deps warn "engine deps (yaml/jinja2)" \
+      "installed (in use), but vendor/python is missing or broken — the offline/air-gapped path would fail" \
+      "rebuild the vendored copies: bin/vendor-deps python"
+  elif [ "$dep_vendored" = true ]; then
+    doctor_add engine_deps pass "engine deps (yaml/jinja2)" "vendored (vendor/python) — the engine runs on a bare interpreter"
+  else
+    doctor_add engine_deps fail "engine deps (yaml/jinja2)" "PyYAML/Jinja2 importable neither from site-packages nor from vendor/python" \
+      "pip install -r requirements.txt   (air-gapped: bin/bootstrap --offline; to restore the bundle: bin/vendor-deps python)"
+  fi
+
+  local ap="" ag=""
+  ap="$(command -v ansible-playbook 2>/dev/null || true)"
+  ag="$(command -v ansible-galaxy 2>/dev/null || true)"
+  if [ -n "$ap" ] && [ -n "$ag" ]; then
+    local aver=""
+    aver="$(ansible-playbook --version 2>/dev/null | head -n1 || true)"
+    doctor_add ansible pass "ansible-playbook/galaxy" "${aver:-present} ($ap)"
+  elif [ -x "$REPO_ROOT/.venv/bin/ansible-playbook" ]; then
+    doctor_add ansible warn "ansible-playbook/galaxy" "present in .venv but not on PATH" \
+      ". $REPO_ROOT/.venv/bin/activate"
+  else
+    doctor_add ansible fail "ansible-playbook/galaxy" "not found on PATH — no collection can run" \
+      "bin/bootstrap   (air-gapped: bin/bootstrap --offline)"
+  fi
+
+  # Collections, checked along ansible.cfg's collections_path (./collections first).
+  local coll_missing="" c ns nm
+  for c in ansible.windows ansible.posix community.general ansible.netcommon; do
+    ns="${c%%.*}"; nm="${c#*.}"
+    if [ -d "$REPO_ROOT/collections/ansible_collections/$ns/$nm" ] \
+       || [ -d "${HOME:-/nonexistent}/.ansible/collections/ansible_collections/$ns/$nm" ] \
+       || [ -d "/usr/share/ansible/collections/ansible_collections/$ns/$nm" ]; then
+      continue
+    fi
+    coll_missing="$coll_missing $c"
+  done
+  if [ -z "$coll_missing" ]; then
+    doctor_add collections pass "ansible collections" "core 4 present (ansible.windows, ansible.posix, community.general, ansible.netcommon)"
+  else
+    doctor_add collections warn "ansible collections" "missing:$coll_missing" \
+      "ansible-galaxy collection install -r requirements.yml -p ./collections   (air-gapped: bin/bootstrap --offline)"
+  fi
+
+  # The ZIP-download trap: GitHub's "Download ZIP" drops the Unix exec bit (README).
+  local noexec="" absent="" f
+  for f in driftwatch bootstrap vendor-deps; do
+    if [ ! -e "$BIN_DIR/$f" ]; then
+      absent="$absent bin/$f"
+    elif [ ! -x "$BIN_DIR/$f" ]; then
+      noexec="$noexec bin/$f"
+    fi
+  done
+  if [ -n "$noexec" ]; then
+    doctor_add exec_bits fail "bin/ exec bits" "not executable:$noexec (a GitHub ZIP download drops the Unix exec bit)" \
+      "chmod +x bin/driftwatch bin/bootstrap bin/vendor-deps"
+  elif [ -n "$absent" ]; then
+    doctor_add exec_bits warn "bin/ exec bits" "missing from this deployment:$absent" \
+      "re-deploy the kit from git (or a complete archive) — bin/ must ship whole"
+  else
+    doctor_add exec_bits pass "bin/ exec bits" "driftwatch, bootstrap, vendor-deps all executable"
+  fi
+
+  # ======================================================= windows transport (design §3.1)
+  doctor_section "windows transport prereqs (design §3.1 — rung 1: Kerberos over WinRM-HTTPS)"
+
+  local kinit_p="" klist_p=""
+  kinit_p="$(command -v kinit 2>/dev/null || true)"
+  klist_p="$(command -v klist 2>/dev/null || true)"
+  if [ -n "$kinit_p" ] && [ -n "$klist_p" ]; then
+    doctor_add krb5_tools pass "krb5 client tools" "kinit + klist present ($kinit_p)"
+  else
+    doctor_add krb5_tools warn "krb5 client tools" \
+      "kinit/klist not both on PATH — Kerberos (rung 1) unavailable; only OpenSSH (rung 2) / NTLM (rung 3) remain" \
+      "sudo apt install krb5-user   (RHEL: sudo dnf install krb5-workstation) — bake this into the kit image"
+  fi
+
+  local realm=""
+  if [ -r /etc/krb5.conf ]; then
+    realm="$(awk -F= '/^[[:space:]]*default_realm/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' /etc/krb5.conf 2>/dev/null || true)"
+    if [ -z "$realm" ]; then
+      realm="$(awk '/^[[:space:]]*\[realms\]/ { f = 1; next } f && /^[[:space:]]*\[/ { f = 0 } f && /=/ { gsub(/[[:space:]]/, "", $1); print $1; exit }' /etc/krb5.conf 2>/dev/null || true)"
+    fi
+    if [ -n "$realm" ]; then
+      doctor_add krb5_conf pass "/etc/krb5.conf realm" "names realm $realm"
+    else
+      doctor_add krb5_conf warn "/etc/krb5.conf realm" "exists but names no realm — kinit has no KDC to talk to" \
+        "add [libdefaults] default_realm = CLIENT.REALM and a [realms] stanza with the client's KDC (design §3.1)"
+    fi
+  else
+    doctor_add krb5_conf warn "/etc/krb5.conf realm" "absent — needed only for the Kerberos rung, but that is the default transport" \
+      "create /etc/krb5.conf with the client's realm + KDC, and point the kit's DNS at the client DC (design §3.1)"
+  fi
+
+  if [ -n "$klist_p" ]; then
+    if klist -s >/dev/null 2>&1; then
+      local princ=""
+      princ="$(klist 2>/dev/null | awk -F': *' '/[Dd]efault principal/ { print $2; exit }' || true)"
+      doctor_add tgt pass "kerberos TGT" "ticket cache holds a TGT${princ:+ for $princ}"
+    else
+      doctor_add tgt warn "kerberos TGT" "no usable TGT in the ticket cache (klist -s)" \
+        "kinit <collector-account>@${realm:-CLIENT.REALM}"
+    fi
+  else
+    doctor_add tgt warn "kerberos TGT" "klist not installed — cannot verify the ticket cache" \
+      "sudo apt install krb5-user, then: kinit <collector-account>@${realm:-CLIENT.REALM}"
+  fi
+
+  # Clock: Kerberos rejects tickets beyond ~5 minutes of skew, and skew + DNS account for
+  # most "Kerberos doesn't work" incidents (design §3.1).
+  local clock_src="" skew="" leap="" tracking=""
+  if command -v chronyc >/dev/null 2>&1; then
+    clock_src="chronyc"
+    tracking="$(chronyc tracking 2>/dev/null || true)"
+    if [ -n "$tracking" ]; then
+      skew="$(printf '%s\n' "$tracking" | awk -F: '/^System time/ { print $2; exit }' | awk '{ print $1 }' || true)"
+      leap="$(printf '%s\n' "$tracking" | awk -F: '/^Leap status/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' || true)"
+    fi
+  elif command -v timedatectl >/dev/null 2>&1; then
+    clock_src="timedatectl"
+    leap="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [ -z "$leap" ]; then
+      leap="$(timedatectl status 2>/dev/null | awk -F': *' '/[Ss]ynchronized/ { print $2; exit }' || true)"
+    fi
+  fi
+  local clock_fix="point chrony at the client's DC/NTP, then step the clock: sudo chronyc makestep && chronyc tracking"
+  if [ -z "$clock_src" ]; then
+    doctor_add clock warn "clock sync (<5 min)" "neither chronyc nor timedatectl on this host — skew is not verifiable here" \
+      "install chrony and sync against the client DC/NTP, or compare the kit clock to the DC by hand before collecting"
+  elif [ -n "$skew" ] && printf '%s' "$skew" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'; then
+    if awk -v s="$skew" 'BEGIN { if (s < 0) s = -s; exit (s >= 300) ? 0 : 1 }'; then
+      doctor_add clock fail "clock sync (<5 min)" "system time is ${skew}s off NTP — past Kerberos' 5-minute tolerance, every ticket will be rejected" \
+        "$clock_fix"
+    elif awk -v s="$skew" 'BEGIN { if (s < 0) s = -s; exit (s >= 60) ? 0 : 1 }'; then
+      doctor_add clock warn "clock sync (<5 min)" "system time is ${skew}s off NTP — drifting toward the 5-minute Kerberos limit" \
+        "$clock_fix"
+    elif [ -n "$leap" ] && [ "$leap" != "Normal" ]; then
+      doctor_add clock warn "clock sync (<5 min)" "offset ${skew}s, but chrony leap status is '$leap' (not synchronised)" \
+        "$clock_fix"
+    else
+      doctor_add clock pass "clock sync (<5 min)" "offset ${skew}s off NTP, chrony leap status ${leap:-unknown}"
+    fi
+  elif [ "$clock_src" = "timedatectl" ]; then
+    case "$leap" in
+      yes|true|synchronized|Synchronized)
+        doctor_add clock pass "clock sync (<5 min)" "NTP-synchronised (timedatectl); offset not reported by this tool" ;;
+      *)
+        doctor_add clock warn "clock sync (<5 min)" "clock is NOT NTP-synchronised (timedatectl NTPSynchronized=${leap:-unknown})" \
+          "sudo timedatectl set-ntp true, or run chrony against the client DC/NTP (design §3.1)" ;;
+    esac
+  else
+    doctor_add clock warn "clock sync (<5 min)" "chronyc is installed but chronyd is not answering (no tracking data)" \
+      "sudo systemctl start chronyd   (Debian/Ubuntu: chrony), then: chronyc tracking"
+  fi
+
+  # ========================================================================== engagement
+  doctor_section "engagement"
+
+  # doctor is the one verb that must work with NO engagement selected — it is what you run
+  # on a fresh kit, before there is anything to select.
+  local eng=""
+  eng="${ENGAGEMENT:-}"
+  [ -n "$eng" ] || eng="${DRIFTWATCH_ENGAGEMENT:-}"
+  if [ -z "$eng" ]; then
+    doctor_add engagement warn "engagement selected" "none — engagement checks skipped (kit checks above are complete)" \
+      "$PROG --engagement <id> doctor, or: export DRIFTWATCH_ENGAGEMENT=<id>"
+  elif [ -d "$REPO_ROOT/engagements/$eng" ]; then
+    ENGAGEMENT="$eng"
+    ENGAGEMENT_DIR="$REPO_ROOT/engagements/$eng"
+    doctor_add engagement pass "engagement volume" "$eng at engagements/$eng"
+    doctor_engagement_checks "$ENGAGEMENT_DIR" "$eng"
+  else
+    doctor_add engagement fail "engagement volume" "'$eng' is selected but engagements/$eng does not exist" \
+      "$PROG new-engagement -i $eng"
+  fi
+
+  # audit.log is the operator's record of everything the tool did in this engagement.
+  if [ -n "$ENGAGEMENT_DIR" ] && [ -d "$ENGAGEMENT_DIR" ]; then
+    audit "doctor" "-" "pass=$DOC_PASS warn=$DOC_WARN fail=$DOC_FAIL" || true
+  fi
+
+  if [ "$DOC_JSON" = true ]; then
+    doctor_emit_json
+  else
+    printf '\n' >&2
+    if [ "$DOC_FAIL" -gt 0 ]; then
+      err "doctor: $DOC_PASS pass, $DOC_WARN warn, $DOC_FAIL FAIL — not ready; each FAIL above names the command that fixes it"
+    else
+      info "doctor: $DOC_PASS pass, $DOC_WARN warn, 0 fail — kit ready (warnings are advisory, not blocking)"
+    fi
+  fi
+
+  [ "$DOC_FAIL" -eq 0 ] || return 1
+  return 0
 }
 
 # Secure-delete a path. On modern SSD/CoW/network filesystems shred cannot guarantee the
@@ -783,10 +1748,14 @@ $PROG — blue-team baseline & drift-detection operator console
 
 usage: $PROG [--engagement <id>] <verb> [options]
   (engagement resolves from --engagement or \$DRIFTWATCH_ENGAGEMENT; required for all
-   verbs except new-engagement, which takes the id as an argument)
+   verbs except new-engagement, which takes the id as an argument, and doctor, which
+   checks the kit itself and only adds the engagement checks when one is selected)
 
 verbs:
-  new-engagement <id>                 create an engagement volume from the template
+  doctor [--json]                     self-check the kit: deps, Kerberos prereqs and
+                                      engagement readiness; exit 1 on any FAIL
+  new-engagement [-i] <id>            create an engagement volume from the template
+                                      (-i/--interactive: guided, validated scope.yml)
   preflight                           Kerberos prereqs + Windows transport matrix
   collect [--deep] [--limit PATTERN] [--collect-only]
                                       scope-gate -> snapshot -> (diff -> report)
@@ -795,11 +1764,17 @@ verbs:
   ship [--run-id R]                   ship findings to the kit SIEM (per scope.yml settings)
   baseline promote <host> <run_id> [--ticket T]
   respond <propose|approve|rollback> ...   passthrough to the response layer
+  gui [--port N] [--no-browser]       operator GUI, bound to 127.0.0.1 only (dashboard,
+                                      findings browser, fleet matrix, setup wizard; no
+                                      response/approve, teardown, or credential surface)
   status                              read-only engagement dashboard
   teardown [--retain a,b,...] [--yes] shred the volume (report kept by default; vault ALWAYS)
 
 examples:
+  $PROG doctor                        # first thing on a fresh kit
   $PROG new-engagement acme-2026-07
+  $PROG new-engagement -i acme-2026-07
+  DRIFTWATCH_ENGAGEMENT=acme-2026-07 $PROG doctor --json | jq .summary
   DRIFTWATCH_ENGAGEMENT=acme-2026-07 $PROG preflight
   $PROG --engagement acme-2026-07 collect --deep
   $PROG --engagement acme-2026-07 teardown --retain report,findings
@@ -822,6 +1797,7 @@ main() {
   [ $# -gt 0 ] && shift || true
 
   case "$verb" in
+    doctor)         cmd_doctor "$@" ;;
     new-engagement) cmd_new_engagement "$@" ;;
     preflight)      cmd_preflight "$@" ;;
     collect)        cmd_collect "$@" ;;
@@ -830,6 +1806,7 @@ main() {
     ship)           cmd_ship "$@" ;;
     baseline)       cmd_baseline "$@" ;;
     respond)        cmd_respond "$@" ;;
+    gui)            cmd_gui "$@" ;;
     status)         cmd_status "$@" ;;
     teardown)       cmd_teardown "$@" ;;
     ""|-h|--help|help) usage ;;

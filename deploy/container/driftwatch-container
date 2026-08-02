@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+#
+# driftwatch-container — run the OPTIONAL driftwatch image with the mounts the kit needs.
+#
+# The image holds code and dependencies only. Everything that is client data, credential,
+# or host state arrives as a bind mount at run time — because anything written into a layer
+# cannot be reliably shredded at teardown (design §15.4). This wrapper exists so that
+# invariant is expressed once, correctly, instead of being retyped as a 200-character
+# `podman run` line on a client site at 22:00.
+#
+#   ./deploy/container/driftwatch-container status
+#   ./deploy/container/driftwatch-container --dry-run collect --deep
+#   DRIFTWATCH_ENGAGEMENT=acme-2026-07 ./deploy/container/driftwatch-container preflight
+#
+# Read deploy/container/README.md first — in particular what --network host does to the
+# egress-firewall scope control (design §15.2 layer 3), and why there are no published ports.
+set -euo pipefail
+
+# --------------------------------------------------------------------------- locations
+SELF="$(cd "$(dirname "$0")" >/dev/null 2>&1 && pwd)/$(basename "$0")"
+CONTAINER_DIR="$(dirname "$SELF")"
+REPO_ROOT="$(cd "$CONTAINER_DIR/../.." >/dev/null 2>&1 && pwd)"
+
+PROG="driftwatch-container"
+
+# --------------------------------------------------------------------------- output
+_tty() { [ -t 2 ]; }
+_col() { if _tty; then printf '\033[%sm' "$1" >&2; fi; }
+info() { _col '0;36'; printf '[%s] ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+warn() { _col '0;33'; printf '[%s] WARN: ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+err()  { _col '0;31'; printf '[%s] ERROR: ' "$PROG" >&2; _col '0'; printf '%s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+note() { printf '          %s\n' "$*" >&2; }
+
+require_cmds() {
+  local missing=() c
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  [ "${#missing[@]}" -eq 0 ] || die "required command(s) not found: ${missing[*]}"
+}
+
+# --------------------------------------------------------------------------- defaults
+IMAGE="${DRIFTWATCH_IMAGE:-driftwatch:latest}"
+RUNTIME=""
+ENGAGEMENTS_DIR="${DRIFTWATCH_ENGAGEMENTS_DIR:-$REPO_ROOT/engagements}"
+# Resolved in resolve_kit_home(), not here: a systemd unit without User= (and cron) runs
+# with HOME unset, and this wrapper is a documented ExecStart= target. Expanding $HOME
+# inline would abort under `set -u` with a bare "HOME: unbound variable" before any
+# diagnostic reached the operator — or, if guarded, silently anchor known_hosts at /.
+KIT_HOME="${DRIFTWATCH_KIT_HOME:-}"
+KRB5_CONF="${DRIFTWATCH_KRB5_CONF:-/etc/krb5.conf}"
+KRB5CC_PATH=""
+# Distinguishes "the operator passed --krb5cc/--krb5-conf ''" (an explicit opt-out of the
+# mount) from "unset", which means "work it out from the environment". Without this the
+# documented `--krb5cc ''` is silently overridden by $KRB5CCNAME and the mount comes back.
+KRB5CC_SET=false
+KRB5_CONF_SET=false
+KNOWN_HOSTS=""
+# host is the default because it is what actually works: reaching segmented in-scope subnets
+# and SSHing to network devices from a NAT'd container bridge is a reliable source of
+# "unreachable" coverage gaps that are really just plumbing. It is ALSO the mode under which
+# the kit's own egress firewall keeps behaving as written — see the warning below and README.
+NETWORK="host"
+SELINUX_RELABEL=false
+DRY_RUN=false
+SHELL_MODE=false
+
+usage() {
+  cat >&2 <<EOF
+$PROG — run the optional driftwatch container with the kit's required mounts
+
+usage: $PROG [wrapper options] [--] <driftwatch verb> [verb options]
+
+wrapper options:
+  --image REF          image to run                (default: $IMAGE)
+  --runtime NAME       podman | docker             (default: podman if present, else docker)
+  --engagements DIR    engagement volume to mount  (default: <repo>/engagements)
+  --home DIR           persistent container HOME   (default: \$XDG_STATE_HOME/driftwatch/home)
+                       holds known_hosts + ansible caches so they survive --rm
+  --krb5-conf PATH     client krb5.conf, mounted ro (default: /etc/krb5.conf)
+  --krb5cc PATH        Kerberos ticket cache file  (default: from \$KRB5CCNAME)
+  --known-hosts PATH   ssh known_hosts to mount rw (default: the one inside --home)
+  --network MODE       host | bridge | none        (default: host)
+  --selinux            add :z to the mounts this wrapper owns (engagement volume + --home)
+                       on SELinux-enforcing hosts. Host system files (krb5.conf) and files
+                       you curate yourself (--known-hosts, vault pass) are never relabelled.
+  --shell              run an interactive shell instead of the operator console
+  --dry-run            print the exact command and exit; run nothing
+  -h, --help           this text
+
+Everything after the first non-option argument (or after --) is passed to bin/driftwatch
+inside the container, verbatim.
+
+examples:
+  $PROG --dry-run collect --deep
+  DRIFTWATCH_ENGAGEMENT=acme-2026-07 $PROG preflight
+  $PROG --network none diff --run-id 2026-07-22T0400Z   # control-node-only work
+EOF
+}
+
+# --------------------------------------------------------------------------- args
+DW_ARGS=()
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image)         IMAGE="${2:-}";           [ -n "$IMAGE" ] || die "--image needs a value"; shift 2 ;;
+      --image=*)       IMAGE="${1#*=}"; shift ;;
+      --runtime)       RUNTIME="${2:-}";         [ -n "$RUNTIME" ] || die "--runtime needs a value"; shift 2 ;;
+      --runtime=*)     RUNTIME="${1#*=}"; shift ;;
+      --engagements)   ENGAGEMENTS_DIR="${2:-}"; [ -n "$ENGAGEMENTS_DIR" ] || die "--engagements needs a value"; shift 2 ;;
+      --engagements=*) ENGAGEMENTS_DIR="${1#*=}"; shift ;;
+      --home)          KIT_HOME="${2:-}";        [ -n "$KIT_HOME" ] || die "--home needs a value"; shift 2 ;;
+      --home=*)        KIT_HOME="${1#*=}"; shift ;;
+      # These three accept an explicitly EMPTY value, which means "do not mount this at
+      # all" — so they check for the presence of an argument, not for its content.
+      --krb5-conf)     [ $# -ge 2 ] || die "--krb5-conf needs a value (use '' to skip the mount)"
+                       KRB5_CONF="$2"; KRB5_CONF_SET=true; shift 2 ;;
+      --krb5-conf=*)   KRB5_CONF="${1#*=}"; KRB5_CONF_SET=true; shift ;;
+      --krb5cc)        [ $# -ge 2 ] || die "--krb5cc needs a value (use '' to skip the mount)"
+                       KRB5CC_PATH="$2"; KRB5CC_SET=true; shift 2 ;;
+      --krb5cc=*)      KRB5CC_PATH="${1#*=}"; KRB5CC_SET=true; shift ;;
+      --known-hosts)   [ $# -ge 2 ] || die "--known-hosts needs a value (use '' to use the one in --home)"
+                       KNOWN_HOSTS="$2"; shift 2 ;;
+      --known-hosts=*) KNOWN_HOSTS="${1#*=}"; shift ;;
+      --network)       NETWORK="${2:-}";         [ -n "$NETWORK" ] || die "--network needs a value"; shift 2 ;;
+      --network=*)     NETWORK="${1#*=}"; shift ;;
+      --selinux)       SELINUX_RELABEL=true; shift ;;
+      --shell)         SHELL_MODE=true; shift ;;
+      --dry-run)       DRY_RUN=true; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      --)              shift; DW_ARGS+=("$@"); break ;;
+      # First non-wrapper argument ends wrapper parsing: everything from here is the
+      # operator console's, including its own --flags (e.g. `collect --deep`).
+      *)               DW_ARGS+=("$@"); break ;;
+    esac
+  done
+}
+
+# --------------------------------------------------------------------------- runtime
+select_runtime() {
+  if [ -n "$RUNTIME" ]; then
+    command -v "$RUNTIME" >/dev/null 2>&1 || die "requested runtime '$RUNTIME' not found in PATH"
+    return 0
+  fi
+  # Rootless podman preferred: a root-owned container daemon on a box holding fleet-wide
+  # admin credentials is a bad trade (design §9 treats the kit as a tier-0 asset).
+  if   command -v podman >/dev/null 2>&1; then RUNTIME="podman"
+  elif command -v docker >/dev/null 2>&1; then RUNTIME="docker"
+  else
+    err "no container runtime found — install podman (preferred) or docker"
+    note "The container is optional. The native kit needs no runtime: ./install.sh"
+    exit 1
+  fi
+}
+
+# The container HOME is where known_hosts lives, and design §9 requires that file to be
+# MAINTAINED across runs — so it has to resolve to a real, stable, per-operator directory or
+# not at all. Failing loudly beats quietly writing it somewhere the next run will not look.
+resolve_kit_home() {
+  [ -z "$KIT_HOME" ] || return 0
+  if   [ -n "${XDG_STATE_HOME:-}" ]; then KIT_HOME="$XDG_STATE_HOME/driftwatch/home"
+  elif [ -n "${HOME:-}" ];           then KIT_HOME="$HOME/.local/state/driftwatch/home"
+  else
+    err "cannot place the container HOME: \$DRIFTWATCH_KIT_HOME, \$XDG_STATE_HOME and \$HOME are all unset"
+    note "That is normal for a systemd unit with no User= — name the directory explicitly:"
+    note "  $PROG --home /var/lib/driftwatch/home <verb>"
+    note "It must persist: it holds the ssh known_hosts design §9 requires be maintained."
+    exit 1
+  fi
+}
+
+# Resolve the Kerberos ticket cache. Only FILE: caches can be bind-mounted; KEYRING:, KCM:
+# and DIR: live outside the filesystem namespace the container can see, and Kerberos
+# failures are famously silent, so say so plainly rather than letting kinit look "fine"
+# and every Windows host report as unreachable (design §3.1).
+resolve_krb5cc() {
+  # An explicit `--krb5cc ''` is an opt-out, not an absence — honour it and mount nothing.
+  if [ "$KRB5CC_SET" = true ]; then
+    [ -n "$KRB5CC_PATH" ] || info "--krb5cc '': no Kerberos ticket cache will be mounted"
+    return 0
+  fi
+  [ -z "$KRB5CC_PATH" ] || return 0
+  local cc="${KRB5CCNAME:-}"
+  case "$cc" in
+    FILE:*) KRB5CC_PATH="${cc#FILE:}" ;;
+    "")     KRB5CC_PATH="/tmp/krb5cc_$(id -u 2>/dev/null || echo 0)" ;;
+    KEYRING:*|KCM:*|DIR:*|MEMORY:*)
+      warn "KRB5CCNAME is '$cc' — that cache type cannot be bind-mounted into a container"
+      note "Re-acquire the TGT into a file cache before running the container:"
+      note "  kinit -c FILE:/tmp/krb5cc <user>@<REALM>"
+      note "  KRB5CCNAME=FILE:/tmp/krb5cc $PROG preflight"
+      KRB5CC_PATH=""
+      ;;
+    *)      KRB5CC_PATH="$cc" ;;   # a bare path, which MIT krb5 also accepts
+  esac
+}
+
+build_command() {
+  local uid gid
+  uid="$(id -u 2>/dev/null || echo 0)"
+  gid="$(id -g 2>/dev/null || echo 0)"
+
+  CMD=("$RUNTIME" run --rm)
+
+  # Interactive only when there is something to be interactive with: `teardown` reads a
+  # confirmation from stdin, but a systemd timer has no tty at all.
+  [ -t 0 ] && CMD+=(--interactive)
+  [ -t 1 ] && CMD+=(--tty)
+
+  # --- hardening -------------------------------------------------------------------
+  # The container makes outbound connections and reads/writes bind mounts. It needs no
+  # capabilities and no privilege escalation to do either.
+  CMD+=(--cap-drop=ALL --security-opt no-new-privileges)
+  # A read-only root filesystem makes "no client data in a layer" structural rather than a
+  # promise: the only writable paths are the bind mounts and a tmpfs. exec is kept on /tmp
+  # because Ansible stages and runs its own module payloads out of a temp dir.
+  CMD+=(--read-only --tmpfs "/tmp:rw,exec,nosuid,nodev,size=1g")
+  CMD+=(--workdir /opt/driftwatch)
+
+  # --- identity --------------------------------------------------------------------
+  # Run as the host operator's uid so files written into the engagement volume stay owned
+  # by the operator. Without keep-id, rootless podman maps the container user into a subuid
+  # range and every write to the bind mount fails with EACCES.
+  CMD+=(--user "$uid:$gid")
+  if [ "$RUNTIME" = "podman" ] && [ "$uid" != "0" ]; then
+    CMD+=(--userns=keep-id)
+  fi
+
+  # --- network ---------------------------------------------------------------------
+  CMD+=(--network "$NETWORK")
+
+  # --- mounts ----------------------------------------------------------------------
+  # :z is applied ONLY to the two directories this wrapper owns end to end (the engagement
+  # volume and the container HOME). Relabelling is a write to the HOST's filesystem labels,
+  # so it stays off /etc/krb5.conf (a system file), off --known-hosts and off the vault
+  # password file — those belong to the operator and to the host, and silently retagging
+  # them would be a side effect nobody asked this wrapper for.
+  local z=""
+  [ "$SELINUX_RELABEL" = true ] && z=",z"
+
+  # The engagement volume: the ONLY path client data may occupy, and it is a mount, never
+  # a layer, so `driftwatch teardown` shreds real files on the encrypted volume (§15.4).
+  CMD+=(--volume "$ENGAGEMENTS_DIR:/opt/driftwatch/engagements:rw$z")
+
+  # Persistent HOME: ansible's fact/collection caches and — the one that matters — the ssh
+  # known_hosts that ansible.cfg's StrictHostKeyChecking=yes depends on (design §9). A
+  # fresh container has none, so without this mount every device is a first contact.
+  CMD+=(--volume "$KIT_HOME:/opt/driftwatch/.home:rw$z")
+  if [ -n "$KNOWN_HOSTS" ]; then
+    CMD+=(--volume "$KNOWN_HOSTS:/opt/driftwatch/.home/.ssh/known_hosts:rw")
+  fi
+
+  # Kerberos. krb5.conf is read-only — it is the client's realm/KDC configuration and the
+  # container has no business editing it. The ticket cache is read-WRITE on purpose: GSSAPI
+  # writes each service ticket it obtains back into the cache, and a read-only ccache turns
+  # that into an authentication failure rather than a cache miss.
+  if [ "$KRB5_CONF_SET" = true ] && [ -z "$KRB5_CONF" ]; then
+    # Explicit opt-out. Not a fault, so not a warning — the operator said so.
+    info "--krb5-conf '': no krb5.conf will be mounted (the image ships none)"
+  elif [ -r "$KRB5_CONF" ]; then
+    CMD+=(--volume "$KRB5_CONF:/etc/krb5.conf:ro")
+  else
+    warn "no readable krb5.conf at '$KRB5_CONF' — Kerberos (transport rung 1) will not work"
+    note "Write the client's realm + KDC there on arrival, or pass --krb5-conf PATH."
+  fi
+  if [ -n "$KRB5CC_PATH" ] && [ -r "$KRB5CC_PATH" ]; then
+    CMD+=(--volume "$KRB5CC_PATH:/tmp/krb5cc:rw")
+    CMD+=(--env "KRB5CCNAME=FILE:/tmp/krb5cc")
+  elif [ -n "$KRB5CC_PATH" ]; then
+    warn "no Kerberos ticket cache at '$KRB5CC_PATH' — run 'kinit <user>@<REALM>' first"
+    note "'driftwatch preflight' will fail loudly at the TGT check, which is the point."
+  fi
+
+  # --- environment -----------------------------------------------------------------
+  # The engagement id is NEVER guessed by the tool (CONTRACTS §1.2); pass through whatever
+  # the operator set so `--engagement` and $DRIFTWATCH_ENGAGEMENT behave the same in or out
+  # of the container.
+  [ -n "${DRIFTWATCH_ENGAGEMENT:-}" ] && CMD+=(--env "DRIFTWATCH_ENGAGEMENT=$DRIFTWATCH_ENGAGEMENT")
+  [ -n "${DRIFTWATCH_OPERATOR:-}" ]   && CMD+=(--env "DRIFTWATCH_OPERATOR=$DRIFTWATCH_OPERATOR")
+  # Vault password: pass the FILE by mount, or let ansible prompt. The secret itself never
+  # goes on a command line (CONTRACTS §6 applies the same rule to SIEM tokens).
+  if [ -n "${ANSIBLE_VAULT_PASSWORD_FILE:-}" ] && [ -r "${ANSIBLE_VAULT_PASSWORD_FILE}" ]; then
+    CMD+=(--volume "$ANSIBLE_VAULT_PASSWORD_FILE:/opt/driftwatch/.home/.vaultpass:ro")
+    CMD+=(--env "ANSIBLE_VAULT_PASSWORD_FILE=/opt/driftwatch/.home/.vaultpass")
+  fi
+
+  # NO -p / --publish, in any code path. There is no web UI and no listener in this project;
+  # keeping a network-listening service off a kit that holds fleet credentials is exactly
+  # the trade design Appendix C.1 made when it rejected AWX.
+
+  # --entrypoint must precede the image reference for both runtimes.
+  if [ "$SHELL_MODE" = true ]; then
+    CMD+=(--entrypoint /bin/bash)
+  fi
+  CMD+=("$IMAGE")
+  CMD+=(${DW_ARGS[@]+"${DW_ARGS[@]}"})
+}
+
+# Render $CMD as a copy-pasteable command line. Deliberately NOT printf '%q': that escapes
+# every comma in `--tmpfs /tmp:rw,exec,...` with backslashes, which is correct shell but
+# unreadable in a --dry-run whose whole job is to be read. Quote only what actually needs it.
+print_cmd() {
+  local a out="" q
+  for a in ${CMD[@]+"${CMD[@]}"}; do
+    case "$a" in
+      ""|*[![:alnum:]_@%+=:,./-]*)
+        q="$(printf '%s' "$a" | sed "s/'/'\\\\''/g")"
+        out="$out '$q'" ;;
+      *)
+        out="$out $a" ;;
+    esac
+  done
+  printf '%s\n' "${out# }"
+}
+
+# `driftwatch` / `driftwatch:latest` is an UNQUALIFIED image name that exists nowhere but
+# this kit. If it is absent locally, both runtimes treat that as "go and fetch it": podman
+# runs short-name resolution against its configured registries (and will prompt for a
+# choice on a tty), docker resolves it to docker.io/library/driftwatch. Either way the one
+# machine in the engagement that holds fleet-wide admin credentials makes an unplanned
+# outbound pull of somebody else's image. Refuse instead, and say how to get the real one.
+require_image() {
+  "$RUNTIME" image inspect "$IMAGE" >/dev/null 2>&1 && return 0
+  err "image '$IMAGE' is not present locally — refusing to let the runtime pull it"
+  note "'$IMAGE' is built by this repo and published nowhere; a pull would fetch an"
+  note "unrelated image from a public registry onto the kit. Build or load it instead:"
+  note "  ./install.sh --mode container                      # build here"
+  note "  $RUNTIME load -i driftwatch-<version>.tar          # air-gapped transfer"
+  note "Or point at one you do have: --image REF (or \$DRIFTWATCH_IMAGE)."
+  exit 1
+}
+
+preflight_paths() {
+  if [ ! -d "$ENGAGEMENTS_DIR" ]; then
+    # A dry run executes nothing, so a missing volume must not stop it printing the command
+    # — previewing the invocation before the encrypted volume is mounted is the normal case.
+    [ "$DRY_RUN" = true ] || die "engagement volume '$ENGAGEMENTS_DIR' does not exist — create/mount it first, or pass --engagements DIR"
+    warn "engagement volume '$ENGAGEMENTS_DIR' does not exist — a real run would refuse here"
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    [ -d "$KIT_HOME" ] || info "would create the persistent container HOME: $KIT_HOME"
+  else
+    if [ ! -d "$KIT_HOME" ]; then
+      info "creating persistent container HOME: $KIT_HOME"
+      warn "known_hosts starts EMPTY — the first connection to every host and device is a"
+      warn "first contact. design §9 requires strict host-key checking against a MAINTAINED"
+      warn "known_hosts; verify those fingerprints deliberately, do not click through them."
+    fi
+    mkdir -p "$KIT_HOME/.ssh"
+    chmod 700 "$KIT_HOME/.ssh" 2>/dev/null || true
+  fi
+
+  if [ -n "$KNOWN_HOSTS" ] && [ ! -f "$KNOWN_HOSTS" ]; then
+    die "--known-hosts '$KNOWN_HOSTS' does not exist (a bind mount cannot create it as a file)"
+  fi
+}
+
+warn_network_mode() {
+  case "$NETWORK" in
+    host)
+      # Not a scare warning — a re-verification prompt. With --network host the container
+      # shares the host netns, so the kit's egress rules apply to its traffic exactly as
+      # they apply to any host process; that is the GOOD case and it should be confirmed
+      # rather than assumed.
+      info "--network host: the kit's egress firewall (design §15.2 layer 3) applies to this"
+      info "                container's traffic as it does to any host process. Re-verify it."
+      ;;
+    bridge|bridge:*|private|slirp4netns|slirp4netns:*|pasta|pasta:*)
+      warn "--network $NETWORK: container traffic is NAT'd out of a bridge, so it traverses"
+      warn "the FORWARD path and NOT the OUTPUT rules an egress firewall is usually written"
+      warn "as. design §15.2 layer 3 is therefore NOT enforced as written — re-verify it in"
+      warn "this mode before collecting, or use --network host."
+      note "Layers 1 (inventory from scope) and 2 (the pre-flight gate) still fail closed."
+      note "Segmented in-scope subnets and network-device SSH also frequently need host mode."
+      ;;
+    none)
+      info "--network none: no network at all. Fine for control-node-only work (diff, report,"
+      info "                status, teardown); collection and preflight will find nothing."
+      ;;
+    *)
+      warn "--network $NETWORK is a custom mode — re-verify the egress-firewall scope control"
+      warn "(design §15.2 layer 3) applies to it before pointing this at a client fleet."
+      ;;
+  esac
+}
+
+main() {
+  parse_args "$@"
+  select_runtime
+  require_cmds "$RUNTIME"
+  resolve_kit_home
+  resolve_krb5cc
+  preflight_paths
+  warn_network_mode
+
+  build_command
+
+  if [ "$DRY_RUN" = true ]; then
+    # The command is the RESULT of --dry-run, so it goes to stdout (as bin/driftwatch does
+    # with a run_id) while every diagnostic above stayed on stderr.
+    info "dry run — this is the exact command; nothing was executed:"
+    print_cmd
+    exit 0
+  fi
+
+  # Deliberately AFTER the dry run: previewing the command must not require the image, and
+  # `image inspect` initialises the runtime's local storage on first call.
+  require_image
+
+  exec "${CMD[@]}"
+}
+
+main "$@"
