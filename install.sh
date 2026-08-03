@@ -431,9 +431,21 @@ check_kerberos_stack() {
   if command -v chronyc >/dev/null 2>&1 || [ -x /usr/sbin/chronyd ]; then
     ok "chrony present (clock sync for the ±5 min Kerberos window)"
   elif command -v timedatectl >/dev/null 2>&1; then
-    advisory "chrony not installed; systemd-timesyncd may be handling the clock"
-    note "Kerberos fails outside ±5 minutes of the DC and the error does not say so."
-    note "Verify with: timedatectl status   — and sync against the CLIENT's NTP/DC on arrival."
+    # Don't hedge — ask. chrony is a *preference* (it re-points at the client's DC easily);
+    # the actual requirement is a synchronised clock, which systemd-timesyncd satisfies just
+    # as well. Reporting "chrony missing" as a warning on an already-synced host is noise
+    # that trains the operator to ignore the one check that silently breaks Kerberos.
+    local synced
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "")"
+    if [ "$synced" = "yes" ]; then
+      ok "system clock is NTP-synchronised (systemd-timesyncd; ±5 min Kerberos window)"
+      note "On arrival, re-point it at the CLIENT's NTP/DC — in sync with the wrong source is"
+      note "  still skew against their DC (design §3.1)."
+    else
+      advisory "system clock is NOT NTP-synchronised — Kerberos needs the kit within 5 min of the DC"
+      note "Kerberos does not report 'clock skew'; it fails in confusing ways (design §3.1)."
+      note "Fix: sudo timedatectl set-ntp true    (or install chrony and point it at the client DC)"
+    fi
   else
     advisory "no clock-sync tooling found — Kerberos needs the kit within 5 minutes of the DC"
     [ -n "$CHRONY_PKG" ] && MISSING_OS_PKGS="$MISSING_OS_PKGS $CHRONY_PKG"
