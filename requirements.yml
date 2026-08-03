@@ -9,6 +9,12 @@
 # Install into the repo-local path the pinned ansible.cfg expects:
 #   ansible-galaxy collection install -r requirements.yml -p ./collections
 #
+# Every version below is VERIFIED PUBLISHED on galaxy.ansible.com (last checked 2026-08-02).
+# Re-check after any edit — a pin naming a version Galaxy never published fails the entire
+# install, and it fails on arrival at the client site with a misleading "Failed to resolve
+# the requested dependencies map" that reads like a proxy/network fault:
+#   python3 scripts/check_pins.py check --latest
+#
 # NOT installable here (bake into the kit IMAGE, per design §3.1):
 #   * krb5-user / krb5-workstation  — kinit, klist for the Kerberos transport
 #   * pywinrm[kerberos]             — WinRM-HTTPS + Kerberos from a non-domain-joined kit
@@ -42,4 +48,4 @@ collections:
   - name: fortinet.fortios           # FortiGate / virtual FortiGate
     version: "2.3.8"
   - name: paloaltonetworks.panos     # PAN-OS (config API collection)
-    version: "2.20.4"
+    version: "2.21.4"                # latest on the 2.x line; 3.x exists but is a major bump
